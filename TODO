@@ -1,0 +1,38 @@
+- File xfer
+
+- ICQ testing and debugging (don't even bother trying it yet)
+
+- Improve error messages -- check for subcodes, etc.
+
+- Offline message support
+
+- Secure connection support
+
+- Replace HTTP-based method of fetching contact icons with the OSCAR method -- connecting to a secondary server that
+  supports BART (service 0x10). Note: The reason I switched to the HTTP method is because ECONNRESET was occurring on
+  the first (main) connection if any packets were sent on that connection after the auth cookie was sent on the second
+  connection. However, incoming packets are received just fine in this situation on the main connection and do not cause ECONNRESET.
+
+- If requesting a new service and our main connection is SSL, add empty TLV 0x8C to the service request.
+  Similarly, if the requested service redirect response (0x05) contains TLV 0x8E, use SSL if val > 0, else no SSL
+
+- Handle server-initiated BOS migrations
+
+- Queue any requests for paused services and replay them after migration is complete or a resume response is sent by the server
+
+- Use setTimeout to send a keepalive packet on FLAP channel 0x05 -- time == 1 min? Digsby & Pidgin use a 30 sec timeout)
+  Note: Pidgin only seems to send keepalive on the main connection, unlike Digsby which sends keepalive on every connection
+  Also: the timer should be (re)started after each write to the socket and thus should not be sent if the connection isn't idle
+
+- Actually reply every x hours (given by the server-initiated USAGE_STATS SNAC) with service 0x0B subtype 0x03
+
+- Pay attention to rate warnings and limits -- automatically do this at the _send() level and queue up commands before we hit
+  the limit and SNACs start dropping?
+
+- Set up an interval to periodically clean out any answered requests or requests that have gone unanswered for some
+  fixed length of time (will require tagging each request with a (unix) timestamp). Although, calling delete can send
+  V8 into a slow case, maybe we should instead just set anything not already undefined to undefined?
+
+- Automatically use a secure connection (to slogin.oscar.aol.com for AOL or slogin.icq.com for ICQ) if options.connection.host
+  is one of the defaults (login.oscar.aol.com for AOL or login.icq.com for ICQ).
+  Port 5190 or 443 can be used for secure connections. Also, there is an alternate non-secure address for AOL: login.messaging.aol.com
