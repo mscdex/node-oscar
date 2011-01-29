@@ -2,10 +2,6 @@
 
 - ICQ testing and debugging (don't even bother trying it yet)
 
-- Improve error messages -- check for subcodes, etc.
-
-- Offline message support (code is there, but isn't fully tested yet)
-
 - Secure connection support
 
 - If requesting a new service and our main connection is SSL, add empty TLV 0x8C to the service request.

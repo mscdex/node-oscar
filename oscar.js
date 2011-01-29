@@ -567,7 +567,7 @@ OscarConnection.prototype.getIcon = function(who, metaData, cb) {
 };
 
 OscarConnection.prototype.getOfflineMsgs = function() {
-  this._send(this._createFLAP(self._state.connections.main, FLAP_CHANNELS.SNAC,
+  this._send(this._createFLAP(this._state.connections.main, FLAP_CHANNELS.SNAC,
     this._createSNAC(SNAC_SERVICES.ICBM, 0x10, NO_FLAGS
     )
   ));
@@ -1605,24 +1605,27 @@ OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
                 break;
               }
             }
-            if (tlvs[0x03])
+            // must check keys since TLV values are set to undefined
+            // for zero-length TLVs
+            var keys = Object.keys(tlvs).map(function(x){return parseInt(x)});
+            if (keys.indexOf(0x03) > -1)
               flags |= ICBM_MSG_FLAGS.ACK;
-            if (tlvs[0x04])
+            if (keys.indexOf(0x04) > -1)
               flags |= ICBM_MSG_FLAGS.AWAY;
-            if (tlvs[0x06]) {
+            if (keys.indexOf(0x06) > -1) {
               flags |= ICBM_MSG_FLAGS.OFFLINE;
               if (tlvs[0x16]) // _should_ always be set for offline messages
-                datetime = new Date((tlvs[0x16][0] << 24) + (tlvs[0x16][1] << 16) + (tlvs[0x16][2] << 8) + tlvs[0x16][3]);
+                datetime = new Date(((tlvs[0x16][0] << 24) + (tlvs[0x16][1] << 16) + (tlvs[0x16][2] << 8) + tlvs[0x16][3]) * 1000);
             }
             if (tlvs[0x08]) {
               var len = (tlvs[0x08][0] << 24) + (tlvs[0x08][1] << 16) + (tlvs[0x08][2] << 8) + tlvs[0x08][3],
                   type = (tlvs[0x08][4] << 8) + tlvs[0x08][5],
                   hash = (tlvs[0x08][6] << 8) + tlvs[0x08][7], // a constant 2 bytes for a hash???
-                  datetime = (tlvs[0x08][8] << 24) + (tlvs[0x08][9] << 16) + (tlvs[0x08][10] << 8) + tlvs[0x08][11]
+                  icndatetime = ((tlvs[0x08][8] << 24) + (tlvs[0x08][9] << 16) + (tlvs[0x08][10] << 8) + tlvs[0x08][11]) * 1000;
               if (len)
                 flags |= ICBM_MSG_FLAGS.HAS_ICON;
             }
-            if (tlvs[0x09]) {
+            if (keys.indexOf(0x09) > -1) {
               flags |= ICBM_MSG_FLAGS.REQ_ICON;
               self._sendIcon(sender.name); // automatically send our icon if we have one set
             }
@@ -1703,8 +1706,8 @@ OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
           while (idx < len) {
             channel = (snac[idx++] << 8) + snac[idx++];
             sender = self._parseUserInfo(snac, idx, true);
-            idx = sender[0];
-            sender = sender[1];
+            idx = sender[1];
+            sender = sender[0];
             numMissed = (snac[idx++] << 8) + snac[idx++];
             reason = (snac[idx++] << 8) + snac[idx++];
             self.emit('missed', sender, numMissed, reason, channel);
@@ -2697,16 +2700,20 @@ OscarConnection.prototype._login = function(error, conn, loginCb, reentry) {
           //   * min msg interval === 0 seconds
           if ((!conn.neededServices || typeof conn.neededServices[SNAC_SERVICES.ICBM] !== 'undefined')
                && conn.availServices[SNAC_SERVICES.ICBM]) {
-            var warnRecv = self._state.svcInfo[SNAC_SERVICES.ICBM].maxReceiverWarn,// \
-                warnSend = self._state.svcInfo[SNAC_SERVICES.ICBM].maxSenderWarn, // -- use defaults for these
-                flags = ICBM_FLAGS.CHANNEL_MSGS_ALLOWED | ICBM_FLAGS.MISSED_CALLS_ENABLED | ICBM_FLAGS.TYPING_NOTIFICATIONS
-                        | ICBM_FLAGS.EVENTS_ALLOWED | ICBM_FLAGS.SMS_SUPPORTED | ICBM_FLAGS.OFFLINE_MSGS_ALLOWED
+            var warnRecv = 0xE703,//self._state.svcInfo[SNAC_SERVICES.ICBM].maxReceiverWarn,// \
+                warnSend = 0x8403,//self._state.svcInfo[SNAC_SERVICES.ICBM].maxSenderWarn, // -- use defaults for these
+                flags = ICBM_FLAGS.CHANNEL_MSGS_ALLOWED
+                        | ICBM_FLAGS.MISSED_CALLS_ENABLED
+                        | ICBM_FLAGS.TYPING_NOTIFICATIONS
+                        | ICBM_FLAGS.EVENTS_ALLOWED
+                        | ICBM_FLAGS.SMS_SUPPORTED
+                        | ICBM_FLAGS.OFFLINE_MSGS_ALLOWED
                         | ICBM_FLAGS.USE_HTML_FOR_ICQ;
             self._send(self._createFLAP(conn, FLAP_CHANNELS.SNAC,
               self._createSNAC(SNAC_SERVICES.ICBM, 0x02, NO_FLAGS,
                 [0x00, 0x00,  (flags >> 24 & 0xFF), (flags >> 16 & 0xFF), (flags >> 8 & 0xFF), (flags & 0xFF),  0x1F, 0x40,
                  (warnSend >> 8 & 0xFF), (warnSend & 0xFF),  (warnRecv >> 8 & 0xFF), (warnRecv & 0xFF),
-                 0x00, 0x00,  0x03, 0xE8]
+                 0x00, 0x00, 0x00, 0x00]
               )
             ));
           }
@@ -2850,7 +2857,12 @@ OscarConnection.prototype._createSNAC = function(serviceID, subtypeID, flags, va
       }
     }
   }
-  var reqID = this._state.reqID = (this._state.reqID === 0x7FFFFFFF ? 1 : this._state.reqID + 1);
+  var reqID;
+  // HACK: Retrieving offline messages requires a SNAC request ID of 0 (??!)
+  if (serviceID === SNAC_SERVICES.ICBM && subtypeID === 0x10)
+    reqID = 0;
+  else
+    reqID = this._state.reqID = (this._state.reqID === 0x7FFFFFFF ? 1 : this._state.reqID + 1);
   return [(serviceID >> 8 & 0xFF), (serviceID & 0xFF),  (subtypeID >> 8 & 0xFF), (subtypeID & 0xFF),
           (flags >> 8 & 0xFF), (flags & 0xFF),  (reqID >> 24 & 0xFF), (reqID >> 16 & 0xFF), (reqID >> 8 & 0xFF), (reqID & 0xFF)].concat(value);
 };
@@ -3544,3 +3556,5 @@ exports.CAPABILITIES = CAPABILITIES;
 exports.SSI_RESULTS = SSI_ACK_RESULTS;
 exports.TYPING_NOTIFY = TYPING_NOTIFY;
 exports.MOTD_TYPES = MOTD_TYPES;
+exports.IM_FLAGS = ICBM_MSG_FLAGS;
+exports.IM_MISSED_REASONS = ICBM_MISSED_REASONS;
