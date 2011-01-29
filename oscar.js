@@ -1,6 +1,6 @@
 var net = require('net'), sys = require('sys'), EventEmitter = require('events').EventEmitter, crypto = require('crypto'), http = require('http');
 var fnEmpty = function() {};
-var debug = fnEmpty/*sys.debug, hexy = require('./hexy').hexy*/, hexyFormat = { caps: 'upper', format: 'twos', numbering: 'none', groupSpacing: 2 };
+var debug = fnEmpty/*console.error, hexy = require('./hexy').hexy*/, hexyFormat = { caps: 'upper', format: 'twos', numbering: 'none', groupSpacing: 2 };
 
 function OscarConnection(options) {
   if (!(this instanceof OscarConnection))
@@ -17,8 +17,7 @@ function OscarConnection(options) {
       allowMultiLogin: true
     }, other: {
       initialStatus: USER_STATUSES.ONLINE,
-      initialFlags: USER_FLAGS.DCDISABLED,
-      autoCacheIcons: true
+      initialFlags: USER_FLAGS.DCDISABLED
     }
   };
   this._options = extend(true, this._options, options);
@@ -26,23 +25,23 @@ function OscarConnection(options) {
   this._state = {
     connections: {},
     serviceMap: {},
-    seqNum: 0, // 0x0000 to 0x7FFF, wraps to 0x0000 past 0x7FFF
     reqID: 0, // 32-bit number that identifies a single SNAC request
     status: this._options.other.initialStatus,
     flags: this._options.other.initialFlags,
     requests: {},
     isAOL: (this._options.connection.host.substr(this._options.connection.host.length-7).toUpperCase() === 'AOL.COM'),
-    isInitialized: false,
     rateLimitGroups: {},
     rateLimits: {},
-    servicesInfo: {},
-    servicesPaused: {},
+    svcInfo: {},
+    svcPaused: {},
     SSI: {},
-    mediaCache: {},
-    iconQueue: []
+    iconQueue: {},
+    rndvCookies: {},
+    chatrooms: {}
   };
 
-  this.aboutme = undefined;
+  this.icon = { datetime: undefined, data: undefined }; // my 'buddy' icon
+  this.me = undefined;
   this.contacts = { lastModified: undefined, list: undefined, permit: undefined, deny: undefined, prefs: undefined, _totalSSICount: 0, _usedIDs: {} };
 }
 sys.inherits(OscarConnection, EventEmitter);
@@ -52,31 +51,62 @@ sys.inherits(OscarConnection, EventEmitter);
 // or the evil AOL wizards will come for you!
 // Just kidding about the wizards, but it will make OSCAR do funny things.
 OscarConnection.prototype.setIdle = function(amount) { // amount is in seconds if an integer is supplied, false disables the idle state
-  if (typeof amount === 'boolean') {
-    if (amount)
-      amount = 1;
-    else
-      amount = 0;
-  } else if (typeof amount !== 'number' || amount < 0)
-    throw new Error('Amount must be a boolean or a positive number');
+  if (typeof amount === 'boolean' && !amount)
+    amount = 0;
+  else if (typeof amount !== 'number' || amount <= 0 || amount === true)
+    throw new Error('Amount must be boolean false or a positive number > 0');
 
-  this._send(this._createFLAP(FLAP_CHANNELS.SNAC,
+  this._send(this._createFLAP(self._state.connections.main, FLAP_CHANNELS.SNAC,
     this._createSNAC(SNAC_SERVICES.GENERIC, 0x11, NO_FLAGS,
       [(amount >> 24 & 0xFF), (amount >> 16 & 0xFF), (amount >> 8 & 0xFF), (amount & 0xFF)]
     )
   ));
 };
 
-OscarConnection.prototype.sendIM = function(who, message, sendOffline, cb) {
-  var msgData, cookie = [], msgLen, self = this;
+// 32-bit little endian conversion
+//((x & 0xFF) << 24) + ((x >> 8 & 0xFF) << 16) + ((x >> 16 & 0xFF) << 8) + (x >> 24 & 0xFF)
+OscarConnection.prototype.sendIM = function(who, message, flags, cb) {
+  var msgData, cookie, msgLen, self = this, features = (self._state.isAOL ? [0x01, 0x01, 0x01, 0x02] : [0x01]),
+      featLen = features.length, charset = ICBM_MSG_CHARSETS.ASCII, isSMS;
   cb = arguments[arguments.length-1];
+  if (typeof flags !== 'number')
+    flags = 0x00000000;
+  if (typeof who === 'object')
+    who = who.name;
+  isSMS = /\+[\d]+/.test(who);
 
-  for (i = 0; i < 8; i++)
-    cookie.push(0x30 + (Math.round(Math.random() * 10)));
+  if (isSMS && !self._state.isAOL) {
+   var uin = parseInt(this._options.connection.username), len, data,
+       req = str2bytes('<icq_sms_message><destination>' + who + '</destination><text>' + message + '</text>'
+                       + '<codepage>1252</codepage><senders_UIN>' + uin + '</senders_UIN>'
+                       + '<senders_name>' + this.me.fullname + '</senders_name>'
+                       + '<delivery_receipt>' + (typeof cb === 'function' ? 'Yes' : 'No') + '</delivery_receipt>'
+                       + '<time>' + (new Date).toUTCString() + '</time>'
+                       + '</icq_sms_message>');
+    data = splitNum(uin, 4).reverse().concat([
+      0xD0, 0x07,  (this._state.reqID & 0xFF) << 8, (this._state.reqID >> 8 & 0xFF),  0x82, 0x14,
+      0x00, 0x01, 0x00, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      (req.length >> 8 & 0xFF), (req.length & 0xFF)
+    ]).concat(req);
+    data.push(0x00);
+    len = data.length;
+    data.unshift(len >> 8 & 0xFF);
+    data.unshift(len & 0xFF);
 
-  who = str2bytes(''+who);
-  if (who.length > 0xFF) {
-    var err = new Error('Screen names cannot be longer than ' + 0xFF + ' characters');
+    self._send(self._createFLAP(self._state.serviceMap[SNAC_SERVICES.ICQ_EXT], FLAP_CHANNELS.SNAC,
+      self._createSNAC(SNAC_SERVICES.ICQ_EXT, 0x02, NO_FLAGS,
+        self._createTLV(0x01, data)
+      )
+    ), cb);
+    return;
+  } else if (isSMS && (flags & ICBM_MSG_FLAGS.OFFLINE))
+    flags -= ICBM_MSG_FLAGS.OFFLINE;
+
+  cookie = splitNum(Date.now(), 4).concat(splitNum(Date.now()+1, 4));
+
+  who = str2bytes(who);
+  if (who.length > MAX_SN_LEN) {
+    var err = new Error('Screen names cannot be longer than ' + MAX_SN_LEN + ' characters');
     if (typeof cb === 'function')
       cb(err);
     else
@@ -85,8 +115,9 @@ OscarConnection.prototype.sendIM = function(who, message, sendOffline, cb) {
   }
 
   message = str2bytes(''+message);
-  if (message.length > 2544) {
-    var err = new Error('IM messages cannot be longer than 2544 characters');
+  if (message.length > MAX_MSG_LEN) {
+    // TODO: try stripping message of any HTML to see if it then fits within the length limit
+    var err = new Error('IM messages cannot be longer than ' + MAX_MSG_LEN + ' characters');
     if (typeof cb === 'function')
       cb(err);
     else
@@ -95,19 +126,28 @@ OscarConnection.prototype.sendIM = function(who, message, sendOffline, cb) {
   }
 
   msgLen = message.length + 4;
-  msgData = [0x05, 0x01,  0x00, 0x04,  0x01, 0x01, 0x01, 0x02,  0x01, 0x01, (msgLen >> 8), (msgLen & 0xFF), 0x00, 0x00, 0x00, 0x00];
-  var content = cookie.concat([0x0, 0x01, who.length])
+  msgData = [0x05, 0x01,  (featLen >> 8 & 0xFF), (featLen & 0xFF)]
+            .concat(features)
+            .concat([0x01, 0x01, (msgLen >> 8 & 0xFF), (msgLen & 0xFF),
+                     (charset >> 8 & 0xFF), (charset & 0xFF), 0x00, 0x00]);
+  var content = cookie.concat([0x00, 0x01, who.length])
                       .concat(who)
-                      .concat(self._createTLV(0x02, msgData.concat(message), true));
+                      .concat(self._createTLV(0x02, msgData.concat(message)));
 
-  // request that the server send us an ACK that the message was sent ok,
-  // but not necessarily received by the destination user (i.e. they are offline)
-  if (typeof cb === 'function')
-    content.append(self._createTLV(0x03));
-  if (typeof sendOffline === 'boolean' && sendOffline)
-    content.append(self._createTLV(0x06));
+  if (flags & ICBM_MSG_FLAGS.AWAY)
+    content = content.concat(self._createTLV(0x04));
+  else {
+    // request that the server send us an ACK that the message was sent ok,
+    // but not necessarily immediately received by the destination user (i.e. they are offline)
+    if (typeof cb === 'function')
+      content = content.concat(self._createTLV(0x03));
+    if (flags & ICBM_MSG_FLAGS.OFFLINE)
+      content = content.concat(self._createTLV(0x06));
+  }
+  if (flags & ICBM_MSG_FLAGS.REQ_ICON)
+    content = content.concat(self._createTLV(0x09));
 
-  self._send(self._createFLAP(FLAP_CHANNELS.SNAC,
+  self._send(self._createFLAP(self._state.connections.main, FLAP_CHANNELS.SNAC,
     self._createSNAC(SNAC_SERVICES.ICBM, 0x06, NO_FLAGS,
       content
     )
@@ -115,13 +155,13 @@ OscarConnection.prototype.sendIM = function(who, message, sendOffline, cb) {
 };
 
 OscarConnection.prototype.setProfile = function(text) {
-  var self = this, maxProfileLen = self._state.servicesInfo[SNAC_SERVICES.LOCATION].maxProfileLen;
+  var self = this, maxProfileLen = self._state.svcInfo[SNAC_SERVICES.LOCATION].maxProfileLen;
   if (text.length > maxProfileLen)
     throw new Error('Profile text cannot exceed max profile length of ' + maxProfileLen + ' characters');
-  self._send(self._createFLAP(FLAP_CHANNELS.SNAC,
+  self._send(self._createFLAP(self._state.connections.main, FLAP_CHANNELS.SNAC,
     self._createSNAC(SNAC_SERVICES.LOCATION, 0x04, NO_FLAGS,
-              self._createTLV(0x01, str2bytes('text/aolrtf; charset="us-ascii"'), true)
-      .concat(self._createTLV(0x02, str2bytes(text), true))
+              self._createTLV(0x01, str2bytes('text/aolrtf; charset="us-ascii"'))
+      .concat(self._createTLV(0x02, str2bytes(text)))
     )
   ));
 };
@@ -132,15 +172,15 @@ OscarConnection.prototype.warn = function(who, isAnonymous, cb) {
   if (self._state.isAOL) {
     var msgLen, self = this;
     who = str2bytes(''+who);
-    if (who.length > 0xFF) {
-      var err = new Error('Screen names cannot be longer than 255 characters');
+    if (who.length > MAX_SN_LEN) {
+      var err = new Error('Screen names cannot be longer than ' + MAX_SN_LEN + ' characters');
       if (typeof cb === 'function')
         cb(err);
       else
         throw err;
       return;
     }
-    self._send(self._createFLAP(FLAP_CHANNELS.SNAC,
+    self._send(self._createFLAP(self._state.connections.main, FLAP_CHANNELS.SNAC,
       self._createSNAC(SNAC_SERVICES.ICBM, 0x08, NO_FLAGS,
         [0x00, (isAnonymous ? 0x01 : 0x00), who.length].concat(who)
       )
@@ -156,8 +196,8 @@ OscarConnection.prototype.warn = function(who, isAnonymous, cb) {
 
 OscarConnection.prototype.notifyTyping = function(who, which) {
   who = str2bytes(''+who);
-  if (who.length > 0xFF)
-    throw new Error('Screen names cannot be longer than 255 characters');
+  if (who.length > MAX_SN_LEN)
+    throw new Error('Screen names cannot be longer than ' + MAX_SN_LEN + ' characters');
 
   var notifyType = [0x00];
   if (typeof which !== 'undefined')
@@ -165,7 +205,7 @@ OscarConnection.prototype.notifyTyping = function(who, which) {
   else
     notifyType.push(0x01);
 
-  self._send(self._createFLAP(FLAP_CHANNELS.SNAC,
+  self._send(self._createFLAP(self._state.connections.main, FLAP_CHANNELS.SNAC,
     self._createSNAC(SNAC_SERVICES.ICBM, 0x14, NO_FLAGS,
       [0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,  0x00, 0x01,  who.length]
       .concat(who)
@@ -180,7 +220,7 @@ OscarConnection.prototype.addContact = function(who, group, cb) {
 
   for (var i=0,groups=Object.keys(self.contacts.list),len=groups.length; i<len; i++)
     contactContact += Object.keys(self.contacts.list[groups[i]].contacts).length;
-  if (contactCount < self._state.servicesInfo[SNAC_SERVICES.SSI].maxGroups) {
+  if (contactCount < self._state.svcInfo[SNAC_SERVICES.SSI].maxGroups) {
     record = (typeof who !== 'object' ? { name: '' } : who);
     if (typeof group !== 'function')
       record.group = group;
@@ -316,7 +356,7 @@ OscarConnection.prototype.moveContact = function(who, newGroup, cb) {
 OscarConnection.prototype.addGroup = function(group, cb) {
   var self = this, check, record, err;
 
-  if (Object.keys(self.contacts.list).length < self._state.servicesInfo[SNAC_SERVICES.SSI].maxGroups) {
+  if (Object.keys(self.contacts.list).length < self._state.svcInfo[SNAC_SERVICES.SSI].maxGroups) {
     record = (typeof group !== 'object' ? { name: '' } : group);
     record.item = 0x00;
     record.type = 0x01;
@@ -462,7 +502,7 @@ OscarConnection.prototype.renameGroup = function(group, newName, cb) {
 
 OscarConnection.prototype.getInfo = function(who, cb) {
   // requests profile, away msg, capabilities
-  this._send(this._createFLAP(FLAP_CHANNELS.SNAC,
+  this._send(this._createFLAP(self._state.connections.main, FLAP_CHANNELS.SNAC,
     this._createSNAC(SNAC_SERVICES.LOCATION, 0x15, NO_FLAGS,
       [0x00, 0x00, 0x00, 0x07,  who.length]
       .concat(str2bytes(who))
@@ -486,21 +526,26 @@ OscarConnection.prototype.delPermit = function(who) {
   // TODO
 };
 
-OscarConnection.prototype.getIcon = function(who, cb) {
-  var icons, self = this, fnGetBest = function(list) {
-    var idx;
-    for (var i=0,best=0; i<list.length; i++) {
-      if (list[i].type > best) {
-        best = list[i].type;
-        idx = i;
-      } else if (typeof idx === 'undefined')
-        idx = i;
-    }
-    process.nextTick(function(){ self._cacheIcons(who, list[idx], cb); });
+OscarConnection.prototype.getIcon = function(who, metaData, cb) {
+  var icons, self = this,
+    fnGetBest = function(list) {
+      var idx;
+      for (var i=0,best=0; i<list.length; i++) {
+        if (list[i].type > best) {
+          best = list[i].type;
+          idx = i;
+        } else if (typeof idx === 'undefined')
+          idx = i;
+      }
+      process.nextTick(function(){ self._downloadIcons((typeof who === 'string' ? who : who.name), list[idx], cb); });
   };
+  cb = arguments[arguments.length-1];
+  if (typeof metaData !== 'function')
+    icons = metaData;
+
   if (typeof who === 'string') {
     var where = self._SSIFindContact(who);
-    if (where[1] === -1) {
+    if (where[1] === -1 && !metaData) {
       self.getInfo(who, function(e, info) {
         if (e || !info.icons) {
           if (typeof cb === 'function')
@@ -510,7 +555,7 @@ OscarConnection.prototype.getIcon = function(who, cb) {
         fnGetBest(info.icons);
       });
       return;
-    } else
+    } else if (where[1] > -1)
       icons = self.contacts.list[where[0]].contacts[where[1]].icons;
   } else if (typeof who === 'object')
     icons = who.icons;
@@ -521,6 +566,87 @@ OscarConnection.prototype.getIcon = function(who, cb) {
     fnGetBest(icons);
 };
 
+OscarConnection.prototype.getOfflineMsgs = function() {
+  this._send(this._createFLAP(self._state.connections.main, FLAP_CHANNELS.SNAC,
+    this._createSNAC(SNAC_SERVICES.ICBM, 0x10, NO_FLAGS
+    )
+  ));
+};
+
+OscarConnection.prototype.joinChat = function(name, cb) {
+  var self = this;
+  if (!self._state.chatrooms[name]) {
+    var exchange = 4;
+    this._send(this._createFLAP(self._state.serviceMap[SNAC_SERVICES.CHAT_NAV], FLAP_CHANNELS.SNAC,
+      this._createSNAC(SNAC_SERVICES.CHAT_NAV, 0x08, NO_FLAGS,
+        [(exchange >> 8) & 0xFF, exchange & 0xFF, 0x06]
+          .concat(str2bytes('create')).concat([0xFF, 0xFF, 0x01, 0x00, 0x03])
+          .concat(this._createTLV(0xD3, name))
+          .concat(this._createTLV(0xD6, 'us-ascii'))
+          .concat(this._createTLV(0xD7, 'en'))
+      )
+    ), function(err, roomInfo) {
+      // CHAT_NAV 0x09 activates this callback
+      if (err) {
+        cb(err);
+        return;
+      }
+      this._addService(SNAC_SERVICES.CHAT, roomInfo, function(err, conn) {
+        if (err) {
+          cb(err);
+          return;
+        }
+        cb();
+      });
+    });
+  } else
+    cb(new Error('You are already in that chat room'));
+};
+
+OscarConnection.prototype.inviteChat = function(name, msg, who) {
+  if (this._state.chatrooms[name]) {
+    if (typeof who === 'undefined') {
+      who = msg;
+      msg = 'Please join me in this chat';
+    }
+    this._chatInvite(who, msg, this._state.chatrooms[name].roomInfo);
+    return true;
+  } else
+    return false;
+};
+
+OscarConnection.prototype.sendChatMsg = function(name, text) {
+  if (this._state.chatrooms[name]) {
+    var conn = this._state.chatrooms[name],
+        cookie = splitNum(Date.now(), 4).concat(splitNum(Date.now()+1, 4));
+    if (text.length > conn.roomInfo.maxMsgLen)
+      return false;
+    this._send(conn, this._createFLAP(conn, FLAP_CHANNELS.SNAC,
+      this._createSNAC(SNAC_SERVICES.CHAT, 0x05, NO_FLAGS,
+        cookie.concat([0x00, 0x03]) // channel
+          .concat(this._createTLV(0x01)) // send to entire chat room
+          .concat(this._createTLV(0x06)) // send us our own message
+          .concat(this._createTLV(0x05, 
+            this._createTLV(0x02, 'us-ascii')
+              .concat(this._createTLV(0x03, 'en'))
+              .concat(this._createTLV(0x01, str2bytes(text)))
+          ))
+      )
+    ));
+    return true;
+  } else
+    return false;
+};
+
+OscarConnection.prototype.leaveChat = function(name) {
+  if (this._state.chatrooms[name]) {
+    this._state.chatrooms[name].destroy();
+    delete this._state.chatrooms[name];
+    return true;
+  } else
+    return false;
+};
+
 OscarConnection.prototype.connect = function(cb) {
   var self = this;
   self._addConnection('login', null, self._options.connection.host, self._options.connection.port, function(e) {
@@ -528,50 +654,19 @@ OscarConnection.prototype.connect = function(cb) {
       self._state.connections.main.authCookie = undefined;
       self._state.connections.main.rateLimitGroups = undefined;
     }
-    if (typeof cb === 'function')
-      cb(e);
-    /*if (e) {
+    if (e) {
       if (typeof cb === 'function')
         cb(e);
       return;
     }
-    if (!self._state.serviceMap[SNAC_SERVICES.BART]) {
-      self._send(self._createFLAP(FLAP_CHANNELS.SNAC,
-        self._createSNAC(SNAC_SERVICES.GENERIC, 0x04, NO_FLAGS,
-          [SNAC_SERVICES.BART >> 8 & 0xFF, SNAC_SERVICES.BART & 0xFF]
-        )
-      ), function(e, address, cookie) {
-        if (e) {
-          if (typeof cb === 'function')
-            cb(e);
-          return;
-        }
-        var services = {}, server, port, id = Date.now();
-        if (address.indexOf(':') > -1) {
-          server = address.substring(0, address.indexOf(':'));
-          port = parseInt(address.substr(address.indexOf(':')+1));
-        } else {
-          server = address;
-          port = self._state.connections.main.remotePort;
-        }
-        services[SNAC_SERVICES.BART] = true;
-        self._addConnection(id, services, server, port, function(e) {
-          self._state.connections[id].authCookie = undefined;
-          self._state.connections[id].rateLimitGroups = undefined;
-          if (e) {
-            if (typeof cb === 'function')
-              cb(e);
-            return;
-          }
-          self._checkIconQueue();
-          if (typeof cb === 'function')
-            process.nextTick(function(){ cb(); });
-        });
-        self._state.connections[id].authCookie = cookie;
-      });
-    } else if (typeof cb === 'function')
-      process.nextTick(function(){ cb(); });
-    */
+    self._addService(SNAC_SERVICES.BART, function(e) {
+      if (e) {
+        if (typeof cb === 'function')
+          cb(e);
+        return;
+      }
+      self._addService(SNAC_SERVICES.CHAT_NAV, cb);
+    });
   });
 };
 
@@ -607,9 +702,9 @@ function data_handler(oscar, data, cb) {
   if (data[0] === 0x2A) {
     switch (data[1]) {
       case FLAP_CHANNELS.CONN_NEW: // new connection negotiation
-        debug('(' + conn.remoteAddress + ') FLAP type: New connection negotiation');
+        debug('(' + conn.remoteAddress + ') RECEIVED FLAP type: New connection negotiation');
         if (conn.serverType === 'login') {
-          self._send(conn, self._createFLAP(FLAP_CHANNELS.CONN_NEW, [0x00, 0x00, 0x00, 0x01])); // send FLAP protocol version
+          self._send(conn, self._createFLAP(conn, FLAP_CHANNELS.CONN_NEW, [0x00, 0x00, 0x00, 0x01])); // send FLAP protocol version
           self._login(undefined, conn, cb);
         } else
           self._login(undefined, conn, cb, 2);
@@ -621,7 +716,7 @@ function data_handler(oscar, data, cb) {
           return;
         else
           conn.curData = undefined;
-        debug('(' + conn.remoteAddress + ') FLAP type: SNAC response');
+        //debug('(' + conn.remoteAddress + ') RECEIVED FLAP type: SNAC response');
         self._parseSNAC(conn, data.slice(6, 6+payloadLen), cb);
         if (data.length > 6 + payloadLen) {
           // extra bytes -- start of another FLAP message?
@@ -633,11 +728,11 @@ function data_handler(oscar, data, cb) {
         }
       break;
       case FLAP_CHANNELS.ERROR: // FLAP-level error
-        debug('(' + conn.remoteAddress + ') FLAP type: FLAP error');
+        debug('(' + conn.remoteAddress + ') RECEIVED FLAP type: FLAP error');
         conn.curData = undefined;
       break;
       case FLAP_CHANNELS.CONN_CLOSE: // close connection negotiation
-        debug('(' + conn.remoteAddress + ') FLAP type: Close connection negotiation');
+        debug('(' + conn.remoteAddress + ') RECEIVED FLAP type: Close connection negotiation');
         if (conn.serverType === 'BOS') {
           var tlvs = extractTLVs(data, 6);
           if (tlvs[TLV_TYPES.ERROR]) {
@@ -655,15 +750,15 @@ function data_handler(oscar, data, cb) {
         conn.curData = undefined;
       break;
       case FLAP_CHANNELS.KEEPALIVE: // keep alive
-        debug('(' + conn.remoteAddress + ') FLAP type: Keep-alive');
+        debug('(' + conn.remoteAddress + ') RECEIVED FLAP type: Keep-alive');
         conn.curData = undefined;
       break;
       default:
-        debug('(' + conn.remoteAddress + ') FLAP type: UNKNOWN (0x' + data[1].toString(16) + ')');
+        debug('(' + conn.remoteAddress + ') RECEIVED FLAP type: UNKNOWN (0x' + data[1].toString(16) + ')');
         conn.curData = undefined;
     }
   } else
-    debug('(' + conn.remoteAddress + ') Non-FLAP message received');
+    debug('(' + conn.remoteAddress + ') RECEIVED Non-FLAP message');
 }
 
 function end_handler(oscar) {
@@ -706,6 +801,7 @@ OscarConnection.prototype._addConnection = function(id, services, host, port, cb
   self._state.connections[id].isTransferring = false;
   self._state.connections[id].isReady = false;
   self._state.connections[id].isConnected = false;
+  self._state.connections[id].seqNum = 0; // 0x0000 to 0x7FFF, wraps to 0x0000 past 0x7FFF
   self._state.connections[id].fnTmrConn = function(cbConn) {
     cbConn(new Error('Connection timed out while connecting to ' + self._state.connections[id].serverType + ' server'));
     self._state.connections[id].destroy();
@@ -719,6 +815,55 @@ OscarConnection.prototype._addConnection = function(id, services, host, port, cb
   self._state.connections[id].on('error', function(err) { error_handler.call(this, self, err, cb); });
   self._state.connections[id].on('close', function(had_error) { close_handler.call(this, self, had_error); });
 }
+
+OscarConnection.prototype._addService = function(svc, roomInfo, cb) {
+  var self = this;
+  if (typeof cb === 'undefined') {
+    cb = roomInfo;
+    roomInfo = undefined;
+  }
+  if (svc === SNAC_SERVICES.CHAT || !self._state.serviceMap[svc]) {
+    var content = [svc >> 8 & 0xFF, svc & 0xFF];
+    if (roomInfo) {
+      content = content.concat(self._createTLV(0x01,
+        [(roomInfo.exchange >> 8) & 0xFF, roomInfo.exchange & 0xFF,
+         roomInfo.cookie.length].concat(roomInfo.cookie).concat([0x00, 0x00])
+      ));
+    }
+    self._send(self._createFLAP(self._state.connections.main, FLAP_CHANNELS.SNAC,
+      self._createSNAC(SNAC_SERVICES.GENERIC, 0x04, NO_FLAGS,
+        content
+      )
+    ), function(e, address, cookie) {
+      if (e) {
+        if (typeof cb === 'function')
+          cb(e);
+        return;
+      }
+      var services = {}, server, port, id = Date.now();
+      if (address.indexOf(':') > -1) {
+        server = address.substring(0, address.indexOf(':'));
+        port = parseInt(address.substr(address.indexOf(':')+1));
+      } else {
+        server = address;
+        port = self._state.connections.main.remotePort;
+      }
+      services[svc] = true;
+      self._addConnection(id, services, server, port, function(e) {
+        self._state.connections[id].authCookie = undefined;
+        self._state.connections[id].rateLimitGroups = undefined;
+        if (!e && roomInfo) {
+          self._state.chatrooms[roomInfo.name] = self._state.connections[id];
+          self._state.chatrooms[roomInfo.name].roomInfo = roomInfo;
+        }
+        if (typeof cb === 'function')
+          process.nextTick(function(){ cb(e, self._state.connections[id]); });
+      });
+      self._state.connections[id].authCookie = cookie;
+    });
+  } else if (typeof cb === 'function')
+    process.nextTick(function(){ cb(); });
+};
 
 // action === 0 (add), 1 (delete), 2 (modify)
 OscarConnection.prototype._SSIModify = function(items, action, cb) {
@@ -775,21 +920,21 @@ OscarConnection.prototype._SSIModify = function(items, action, cb) {
       if (items[i].type === 0x00) {
         if (items[i].localInfo) {
           if (items[i].localInfo.alias)
-            itemBytes = itemBytes.concat(self._createTLV(0x0131, str2bytes(items[i].localInfo.alias), true));
+            itemBytes = itemBytes.concat(self._createTLV(0x0131, str2bytes(items[i].localInfo.alias)));
           if (items[i].localInfo.emailAddress)
-            itemBytes = itemBytes.concat(self._createTLV(0x0137, str2bytes(items[i].localInfo.emailAddress), true));
+            itemBytes = itemBytes.concat(self._createTLV(0x0137, str2bytes(items[i].localInfo.emailAddress)));
           if (items[i].localInfo.homePhoneNum)
-            itemBytes = itemBytes.concat(self._createTLV(0x0138, str2bytes(items[i].localInfo.homePhoneNum), true));
+            itemBytes = itemBytes.concat(self._createTLV(0x0138, str2bytes(items[i].localInfo.homePhoneNum)));
           if (items[i].localInfo.cellPhoneNum)
-            itemBytes = itemBytes.concat(self._createTLV(0x0139, str2bytes(items[i].localInfo.cellPhoneNum), true));
+            itemBytes = itemBytes.concat(self._createTLV(0x0139, str2bytes(items[i].localInfo.cellPhoneNum)));
           if (items[i].localInfo.smsPhoneNum)
-            itemBytes = itemBytes.concat(self._createTLV(0x013A, str2bytes(items[i].localInfo.smsPhoneNum), true));
+            itemBytes = itemBytes.concat(self._createTLV(0x013A, str2bytes(items[i].localInfo.smsPhoneNum)));
           if (items[i].localInfo.workPhoneNum)
-            itemBytes = itemBytes.concat(self._createTLV(0x0158, str2bytes(items[i].localInfo.workPhoneNum), true));
+            itemBytes = itemBytes.concat(self._createTLV(0x0158, str2bytes(items[i].localInfo.workPhoneNum)));
           if (items[i].localInfo.otherPhoneNum)
-            itemBytes = itemBytes.concat(self._createTLV(0x0159, str2bytes(items[i].localInfo.otherPhoneNum), true));
+            itemBytes = itemBytes.concat(self._createTLV(0x0159, str2bytes(items[i].localInfo.otherPhoneNum)));
           if (items[i].localInfo.notes)
-            itemBytes = itemBytes.concat(self._createTLV(0x013C, str2bytes(items[i].localInfo.notes), true));
+            itemBytes = itemBytes.concat(self._createTLV(0x013C, str2bytes(items[i].localInfo.notes)));
         }
         // TODO: support adding/modifying the alerts for this contact and check maxWatchers first
       } else if (items[i].type === 0x01) {
@@ -804,11 +949,11 @@ OscarConnection.prototype._SSIModify = function(items, action, cb) {
             ids.push(children[j] & 0xFF);
           }
           if (ids.length > 0)
-            itemBytes = itemBytes.concat(self._createTLV(0x00C8, ids, true));
+            itemBytes = itemBytes.concat(self._createTLV(0x00C8, ids));
         }
       } else if (items[i].tlvs) {
         for (var j=0,types=Object.keys(items[i].tlvs),len2=types.length; j<len2; j++)
-          itemBytes = itemBytes.concat(self._createTLV(parseInt(types[j]), items[i].tlvs[types[j]], true));
+          itemBytes = itemBytes.concat(self._createTLV(parseInt(types[j]), items[i].tlvs[types[j]]));
       }
     }
     bytes.push(itemBytes.length >> 8 & 0xFF);
@@ -822,7 +967,7 @@ OscarConnection.prototype._SSIModify = function(items, action, cb) {
   else if (action === 2)
     subtype = 0x09;
 
-  self._send(self._createFLAP(FLAP_CHANNELS.SNAC,
+  self._send(self._createFLAP(self._state.connections.main, FLAP_CHANNELS.SNAC,
     self._createSNAC(SNAC_SERVICES.SSI, subtype, NO_FLAGS,
       bytes
     )
@@ -834,7 +979,7 @@ OscarConnection.prototype._SSIModify = function(items, action, cb) {
 
 OscarConnection.prototype._SSIStartTrans = function() {
   var self = this;
-  self._send(self._createFLAP(FLAP_CHANNELS.SNAC,
+  self._send(self._createFLAP(self._state.connections.main, FLAP_CHANNELS.SNAC,
     self._createSNAC(SNAC_SERVICES.SSI, 0x11, NO_FLAGS
     )
   ));
@@ -842,7 +987,7 @@ OscarConnection.prototype._SSIStartTrans = function() {
 
 OscarConnection.prototype._SSIEndTrans = function() {
   var self = this;
-  self._send(self._createFLAP(FLAP_CHANNELS.SNAC,
+  self._send(self._createFLAP(self._state.connections.main, FLAP_CHANNELS.SNAC,
     self._createSNAC(SNAC_SERVICES.SSI, 0x12, NO_FLAGS
     )
   ));
@@ -894,15 +1039,6 @@ OscarConnection.prototype._SSIFindContact = function(group, contact) {
   return retVal;
 };
 
-OscarConnection.prototype._checkIconQueue = function() {
-  var queue = this._state.iconQueue;
-  if (queue) {
-    var users = Object.keys(this._state.iconQueue);
-    for (var i=0,len=users.length; i<len; i++)
-      this._cacheIcons(users[i], queue[users[i]]);
-  }
-};
-
 OscarConnection.prototype._send = function(conn, payload, cb) {
   var self = this, isSNAC, svc;
   if (!(conn instanceof net.Stream)) {
@@ -917,10 +1053,7 @@ OscarConnection.prototype._send = function(conn, payload, cb) {
 
   if (isSNAC) {
     if (Object.keys(conn.availServices).length > 0 && typeof conn.availServices[svc] === 'undefined') {
-      // TODO: try first asking the current BOS server for a BOS server that supports the missing service
-      //       and create and _add_ an extra connection (to a list keyed on service id) to the BOS server given if
-      //       one is available?
-      var err = new Error('The server does not support this SNAC: 0x' + svc.toString(16));
+      var err = new Error('No available server supports the requested SNAC: 0x' + svc.toString(16));
       if (typeof cb === 'function')
         cb(err);
       else
@@ -932,6 +1065,7 @@ OscarConnection.prototype._send = function(conn, payload, cb) {
       this._state.requests[reqID] = cb;
     }
   }
+  payload = new Buffer(payload);
   debug('(' + conn.remoteAddress + ') SENDING: \n' + sys.inspect(payload) + '\n');
   conn.write(payload);
 };
@@ -944,15 +1078,146 @@ OscarConnection.prototype._dispatch = function(reqID) {
   }
 };
 
+OscarConnection.prototype._incomingFile = function(info, data) {
+  var fileInfo = {}, i = 0, len;
+  fileInfo.subtype = (data[i++] << 8) + data[i++]; // 0x0001 === 'one file', 0x0002 === 'more than one file'
+  fileInfo.numFiles = (data[i++] << 8) + data[i++];
+  fileInfo.totalSize = (data[i++] << 24) + (data[i++] << 16) + (data[i++] << 8) + data[i++];
+  fileInfo.filename = data.toString(i, i+(data.length-1)); // string is null-terminated
+  return fileInfo;
+};
+
+OscarConnection.prototype._incomingIcon = function(info, data) {
+  var i = 0, hash = (data[i++] << 24) + (data[i++] << 16) + (data[i++] << 8) + data[i++],
+      len = (data[i++] << 24) + (data[i++] << 16) + (data[i++] << 8) + data[i++],
+      datetime = (data[i++] << 24) + (data[i++] << 16) + (data[i++] << 8) + data[i++];
+  return { hash: hash, datetime: datetime, data: data.slice(i, i+len) };
+};
+
+OscarConnection.prototype._incomingChat = function(info, data) {
+  var roomInfo = {}, i = 0, len;
+  roomInfo.exchange = (data[i++] << 8) + data[i++];
+  len = data[i++];
+  roomInfo.name = data.toString('utf8', i, i+len);
+  i += len;
+  roomInfo.instance = (data[i++] << 8) + data[i++];
+  return roomInfo;
+};
+
+OscarConnection.prototype._incomingList = function(info, data) {
+  var list = {};
+  for (var i=0,len=data.length,group,namelen,numContacts; i<len;) {
+    namelen = (data[i++] << 8) + data[i++];
+    group = data.toString('utf8', i, i+namelen);
+    list[group] = [];
+    i += namelen;
+    numContacts = (data[i++] << 8) + data[i++];
+    for (var j=0; j<numContacts; j++) {
+      namelen = (data[i++] << 8) + data[i++];
+      list[group].push(data.toString('utf8', i, i+namelen));
+      i += namelen;
+    }
+  }
+  return list;
+};
+
+OscarConnection.prototype._calcIconSum = function(icon) {
+  var sum = 0; // 16-bit
+  if (Buffer.isBuffer(icon) || Array.isArray(icon)) {
+    var iconLen = icon.length, i;
+    for (i=0; i+1<iconLen; i+=2)
+      sum += (icon[i+1] << 8) + icon[i];
+    if (i < iconLen)
+      sum += icon[i];
+    sum = ((sum & 0xFFFF0000) >> 16) + (sum & 0x0000FFFF);
+  }
+  return sum;
+};
+
+OscarConnection.prototype._sendIcon = function(who) {
+  if (Buffer.isBuffer(this.icon.data) || Array.isArray(this.icon.data)) {
+    if (this.icon.data.length < MAX_ICON_LEN) {
+      var content = [], cookie;
+      who = str2bytes(who);
+      cookie = splitNum(Date.now(), 4).concat(splitNum(Date.now()+1, 4));
+      content = content.concat(cookie).concat[0x00, 0x02, who.length].concat(who)
+                       .concat(this._createTLV(0x05, [0x00, 0x00].concat(cookie).concat(CAPABILITIES.BUDDY_ICON)));
+      content = content.concat(this._createTLV(0x0A, [0x00, 0x01]));
+      content = content.concat(this._createTLV(0x0F));
+      content = content.concat(this._createTLV(0x2711, [0x00].concat(splitNum(this._calcIconSum(this.icon.data), 2))
+                                                             .concat(splitNum(this.icon.data.length, 4))
+                                                             .concat(splitNum(this.icon.datetime, 4))
+      ));
+      for (var i=0,len=this.icon.data.length; i<len; i++)
+        content.push(this.icon.data[i]);
+      content = content.concat(str2bytes('AVT1picture.id'));
+
+      this._send(this._createFLAP(self._state.connections.main, FLAP_CHANNELS.SNAC,
+        this._createSNAC(SNAC_SERVICES.ICBM, 0x06, NO_FLAGS,
+          content
+        )
+      ));
+    } else
+      debug('Uh oh, my icon exceeds the maximum icon size of ' + MAX_ICON_LEN + ' bytes. Cannot send it to: ' + who);
+  }
+};
+
+OscarConnection.prototype._cancelRendezvous = function(cookie, cb) {
+  cookie = ''+cookie;
+  var info = rndvCookies[cookie];
+  if (typeof info !== 'undefined') {
+    var content, type;
+    cookie = info.cookie;
+    if (info.type === 'chat')
+      type = CAPABILITIES.CHAT;
+    content = cookie.concat[0x00, 0x02, who.length].concat(who).concat(this._createTLV(0x03))
+                    .concat(this._createTLV(0x05, [0x00, 0x01].concat(cookie).concat(type).concat(this._createTLV(0x0B))));
+    this._send(this._createFLAP(self._state.connections.main, FLAP_CHANNELS.SNAC,
+      this._createSNAC(SNAC_SERVICES.ICBM, 0x06, NO_FLAGS,
+        content
+      )
+    ), cb);
+  }
+};
+
+OscarConnection.prototype._chatInvite = function(who, msg, roomInfo) {
+  var content, cookie;
+  who = str2bytes(who);
+  msg = str2bytes(msg);
+  name = str2bytes(roomInfo.name);
+  exchange = splitNum(roomInfo.exchange, 2);
+  instance = splitNum(roomInfo.instance, 2);
+  cookie = splitNum(Date.now(), 4).concat(splitNum(Date.now()+1, 4));
+  this._state.rndvCookies[cookie.join('')] = {
+    cookie: cookie,
+    type: 'chat',
+    user: who,
+    name: name,
+    exchange: exchange,
+    instance: instance
+  };
+  content = cookie.concat([0x00, 0x02, who.length]).concat(who)
+                  .concat(this._createTLV(0x05, [0x00, 0x00].concat(cookie).concat(CAPABILITIES.CHAT)
+                              .concat(this._createTLV(0x0A, [0x00, 0x01])).concat(this._createTLV(0x0F))
+                              .concat(this._createTLV(0x0C, msg))
+                              .concat(this._createTLV(0x2711, exchange.concat(name).concat(instance)))));
+  this._send(this._createFLAP(this._state.connections.main, FLAP_CHANNELS.SNAC,
+    this._createSNAC(SNAC_SERVICES.ICBM, 0x06, NO_FLAGS,
+      content
+    )
+  ));
+};
+
 OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
-  debug('(' + conn.remoteAddress + ') SNAC response follows:\n' + sys.inspect(snac));
-  var serviceID, subtypeID, flags, reqID, tlvs, idx, isServerOrig, moreFollows, self = this;
+  //debug('(' + conn.remoteAddress + ') SNAC response follows:\n' + sys.inspect(snac));
+  var serviceID, subtypeID, flags, reqID, tlvs, idx, isServerOrig, moreFollows,
+      debugtext, self = this;
   serviceID = (snac[0] << 8) + snac[1];
   subtypeID = (snac[2] << 8) + snac[3];
   flags = (snac[4] << 8) + snac[5];
   reqID = (snac[6] << 24) + (snac[7] << 16) + (snac[8] << 8) + snac[9];
   isServerOrig = (flags < 0); // MSB === 1 indicates the SNAC is not the result of a client request,
-                              // (i.e. the server is asking(/telling) us something)
+                              // (i.e. the server is asking/telling us something)
   moreFollows = (flags & 0x1); // At least one more packet of the same SNAC service and subtype (?) will come after this packet
   idx = 10;
   if (flags & 0x8000) {
@@ -960,43 +1225,50 @@ OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
     // so skip it to get to the real data
     idx += 2+((snac[idx] << 8) + snac[idx+1]);
   }
+  debugtext = '(' + conn.remoteAddress + ') RECEIVED SNAC: ';
   switch (serviceID) {
     case SNAC_SERVICES.AUTH:
-      debug('(' + conn.remoteAddress + ') SNAC service type: AUTH');
+      debugtext += 'AUTH > ';
       switch (subtypeID) {
+        case 0x03:
+          debugtext += 'MD5 login reply';
+          tlvs = extractTLVs(snac);
+          if (tlvs[TLV_TYPES.ERROR]) {
+            var err = new Error(AUTH_ERRORS_TEXT[(tlvs[TLV_TYPES.ERROR][0] << 8) + tlvs[TLV_TYPES.ERROR][1]]);
+            debugtext += '(error: ' + err + ')';
+            if (typeof cb === 'function')
+              cb(err);
+            else
+              throw err;
+          } else {
+            self._dispatch(reqID, undefined, tlvs[TLV_TYPES.BOS_SERVER].toString(), tlvs[TLV_TYPES.AUTH_COOKIE].toArray());
+            debugtext += '(no error)';
+          }
+        break;
         case 0x07: // md5 salt
+          debugtext += 'MD5 key/salt';
           var saltLen, salt;
           saltLen = (snac[idx++] << 8) + snac[idx++];
           salt = snac.toString('utf8', idx, idx+saltLen);
           self._dispatch(reqID, undefined, salt);
         break;
-        case 0x03:
-          tlvs = extractTLVs(snac);
-          if (tlvs[TLV_TYPES.ERROR]) {
-            var err = new Error(AUTH_ERRORS_TEXT[(tlvs[TLV_TYPES.ERROR][0] << 8) + tlvs[TLV_TYPES.ERROR][1]]);
-            if (typeof cb === 'function')
-              cb(err);
-            else
-              throw err;
-            return;
-          } else
-            self._dispatch(reqID, undefined, tlvs[TLV_TYPES.BOS_SERVER].toString(), tlvs[TLV_TYPES.AUTH_COOKIE]);
-        break;
         default:
-          debug('(' + conn.remoteAddress + ') Unknown subtype ID: 0x' + subtypeID.toString(16));
+          debugtext += 'Unknown (0x' + subtypeID.toString(16) + ')';
       }
     break;
     case SNAC_SERVICES.GENERIC:
-      debug('(' + conn.remoteAddress + ') SNAC service type: GENERIC');
+      debugtext += 'GENERIC > ';
       switch (subtypeID) {
         case 0x01: // error
+          debugtext += 'Error';
           var code = (snac[idx++] << 8) + snac[idx++], msg = GLOBAL_ERRORS_TEXT[code] || 'Unknown error code received: ' + code,
               err = new Error(msg);
           err.code = code;
-          debug('(' + conn.remoteAddress + ') GENERIC global error: ' + msg);
+          debugtext += ': ' + msg;
           self._dispatch(reqID, err);
         break;
         case 0x03:
+          debugtext += 'Supported services: ';
           var debugAvail = [], services = flip(SNAC_SERVICES);
           for (var len=snac.length,svc; idx<len;) {
             svc = (snac[idx++] << 8) + snac[idx++];
@@ -1004,14 +1276,22 @@ OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
             if (typeof services[svc] !== 'undefined')
               debugAvail.push(services[svc]);
           }
-          debug('(' + conn.remoteAddress + ') Services available: ' + debugAvail.join(', '));
+          debugtext += debugAvail.join(', ');
           self._login(undefined, conn, cb, 3);
         break;
         case 0x05: // redirect info for requested service
+          debugtext += 'Service request info';
+          var services = flip(SNAC_SERVICES);
           tlvs = extractTLVs(snac, idx);
-          self._dispatch(reqID, undefined, tlvs[0x05].toString(), tlvs[0x06]);
+          if (typeof services[(tlvs[0x0D][0] << 8) + tlvs[0x0D][1]] !== 'undefined')
+            debugtext += ' (' + services[(tlvs[0x0D][0] << 8) + tlvs[0x0D][1]] + ')';
+          else
+            debugtext += ' (Unknown: ' + ((tlvs[0x0D][0] << 8) + tlvs[0x0D][1]).toString(16) + ')';
+          debugtext += '. Host: ' + tlvs[0x05].toString();
+          self._dispatch(reqID, undefined, tlvs[0x05].toString(), tlvs[0x06].toArray());
         break;
         case 0x07:
+          debugtext += 'Rate limit classes and groups';
           var numGroups = 0, classId;
           if (typeof snac[idx] !== 'undefined') {
             numGroups = (snac[idx++] << 8) + snac[idx++];
@@ -1065,6 +1345,7 @@ OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
           self._dispatch(reqID);
         break;
         case 0x0A: // change in rate limiting
+          debugtext += 'Rate limit change';
           var code = (snac[idx++] << 8) + snac[idx++], classId, group;
           classId = (snac[idx++] << 8) + snac[idx++];
           group = {
@@ -1087,22 +1368,23 @@ OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
           // TODO: if code === RATE_UPDATES.CHANGED, automatically request new rate limits if not given in this SNAC?
         break;
         case 0x0B: // stop sending packets to the server
-          //if (self._state.servicesPaused[conn.id])
-            self._state.servicesPaused[conn.id] = {};
+          debugtext += '"Stop sending packets"';
+          //if (self._state.svcPaused[conn.id])
+            self._state.svcPaused[conn.id] = {};
           if (typeof snac[idx] === 'undefined') {
             conn.isReady = false;
-            self._send(self._createFLAP(FLAP_CHANNELS.SNAC,
+            self._send(self._createFLAP(self._state.connections.main, FLAP_CHANNELS.SNAC,
               self._createSNAC(SNAC_SERVICES.GENERAL, 0x0C, NO_FLAGS
               )
             ));
           } else {
             var ack = [];
             for (len=snac.length; idx < len; idx+=2) {
-              self._state.servicesPaused[conn.id][(snac[idx] << 8) + snac[idx+1]] = true;
+              self._state.svcPaused[conn.id][(snac[idx] << 8) + snac[idx+1]] = true;
               ack.push(snac[idx]);
               ack.push(snac[idx+1]);
             }
-            self._send(self._createFLAP(FLAP_CHANNELS.SNAC,
+            self._send(self._createFLAP(self._state.connections.main, FLAP_CHANNELS.SNAC,
               self._createSNAC(SNAC_SERVICES.GENERAL, 0x0C, NO_FLAGS,
                 ack
               )
@@ -1110,67 +1392,81 @@ OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
           }
         break;
         case 0x0D: // resume sending packets
+          debugtext += '"Resume sending packets"';
           if (typeof snac[idx] === 'undefined') {
-            //if (self._state.servicesPaused[conn.id])
-              self._state.servicesPaused[conn.id] = {};
+            //if (self._state.svcPaused[conn.id])
+              self._state.svcPaused[conn.id] = {};
             conn.isReady = true;
           } else {
             for (len=snac.length; idx < len; idx+=2) {
-              if (self._state.servicesPaused[conn.id][(snac[idx] << 8) + snac[idx+1]])
-                self._state.servicesPaused[conn.id][(snac[idx] << 8) + snac[idx+1]] = undefined;
+              if (self._state.svcPaused[conn.id][(snac[idx] << 8) + snac[idx+1]])
+                self._state.svcPaused[conn.id][(snac[idx] << 8) + snac[idx+1]] = undefined;
             }
           }
         break;
         case 0x0F: // user info about self
-          self.aboutme = self._parseUserInfo(snac, idx);
+          debugtext += 'Info about myself';
+          self.me = self._parseUserInfo(snac, idx);
         break;
         case 0x10: // somebody warned us
-          var oldLevel = self.aboutme.warnLevel, newLevel = (snac[idx++] << 8) + snac[idx++], who, whoWarnLevel;
+          debugtext += 'Warning received by: ';
+          var oldLevel = self.me.warnLevel, newLevel = (snac[idx++] << 8) + snac[idx++], who, whoWarnLevel;
           if (idx < snac.length) {
             // non-anonymous warning
             who = snac.toString('utf8', idx+1, idx+1+snac[idx]);
             idx += 1+snac[idx];
             whoWarnLevel = (snac[idx] << 8) + snac[idx+1];
-          }
-          self.aboutme.warnLevel = newLevel;
+            debugtext += who + ' (' + whoWarnLevel + ')';
+          } else
+            debugtext += '<anonymous>';
+          self.me.warnLevel = newLevel;
+          debugtext += '. Warn level ' + oldLevel + ' -> ' + newLevel;
           if (who)
             self.emit('warn', oldLevel, newLevel, who, whoWarnLevel);
           else
             self.emit('warn', oldLevel, newLevel);
         break;
         case 0x12: // TODO: last step in BOS server migration
+          debugtext += 'Last step in server migration';
         break;
         case 0x13: // MOTD
+          debugtext += 'MOTD';
           var msgTypes = flip(MOTD_TYPES), type = (snac[idx++] << 8) + snac[idx++], msg;
           tlvs = extractTLVs(snac, idx);
           if (tlvs[0x0B])
             msg = tlvs[0x0B].toString();
           self.emit('motd', type, msg);
         break;
-        case 0x15: // "well known urls" -- no idea to the format of this one
+        case 0x15: // 'well known urls' -- no idea to the format of this one
+          debugtext += 'Well-known URLs';
         break;
         case 0x18:
+          debugtext += 'Service versions';
           for (var len=snac.length; idx<len;)
             conn.availServices[(snac[idx++] << 8) + snac[idx++]] = (snac[idx++] << 8) + snac[idx++];
           self._login(undefined, conn, cb, 4);
         break;
         default:
-          debug('(' + conn.remoteAddress + ') Unknown subtype ID: 0x' + subtypeID.toString(16));
+          debugtext += 'Unknown (0x' + subtypeID.toString(16) + ')';
       }
     break;
     case SNAC_SERVICES.LOCATION:
-      debug('(' + conn.remoteAddress + ') SNAC service type: LOCATION');
+      debugtext += 'LOCATION > ';
       switch (subtypeID) {
         case 0x03: // limits response
+          debugtext += 'Service limits';
           tlvs = extractTLVs(snac);
-          if (!self._state.servicesInfo[SNAC_SERVICES.LOCATION]) {
-            self._state.servicesInfo[SNAC_SERVICES.LOCATION] = {};
-            self._state.servicesInfo[SNAC_SERVICES.LOCATION].maxProfileLen = (tlvs[0x01][0] << 8) + tlvs[0x01][1];
-            self._state.servicesInfo[SNAC_SERVICES.LOCATION].maxCapabilities = (tlvs[0x02][0] << 8) + tlvs[0x02][1];
+          if (!self._state.svcInfo[SNAC_SERVICES.LOCATION]) {
+            self._state.svcInfo[SNAC_SERVICES.LOCATION] = {};
+            self._state.svcInfo[SNAC_SERVICES.LOCATION].maxProfileLen = (tlvs[0x01][0] << 8) + tlvs[0x01][1];
+            self._state.svcInfo[SNAC_SERVICES.LOCATION].maxCapabilities = (tlvs[0x02][0] << 8) + tlvs[0x02][1];
           }
+          debugtext += ': maxProfileLen = ' + ((tlvs[0x01][0] << 8) + tlvs[0x01][1]);
+          debugtext += ', maxCapabilities = ' + ((tlvs[0x02][0] << 8) + tlvs[0x02][1]);
           self._dispatch(reqID);
         break;
         case 0x06: // user info response
+          debugtext += 'User info for ';
           var info = self._parseUserInfo(snac, idx, true);
           idx = info[1];
           info = info[0];
@@ -1194,41 +1490,45 @@ OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
               info.capabilities.push(caps.slice(i, i+16));
           }
           var check = self._SSIFindContact(info.name);
-          if (check[1] !== -1) {
-            //self.contacts.list[check[0]].contacts[check[1]] = extend(true, self.contacts.list[check[0]].contacts[check[1]], info);
+          if (check[1] !== -1)
             self._mergeInfo(info.name, info);
-          }
+          debugtext += info.name;
           self._dispatch(reqID, undefined, info);
         break;
         default:
-          debug('(' + conn.remoteAddress + ') Unknown subtype ID: 0x' + subtypeID.toString(16));
+          debugtext += 'Unknown (0x' + subtypeID.toString(16) + ')';
       }
     break;
     case SNAC_SERVICES.LIST_MGMT:
-      debug('(' + conn.remoteAddress + ') SNAC service type: LIST_MGMT');
+      debugtext += 'LIST_MGMT > ';
       switch (subtypeID) {
         case 0x03: // limits response
+          debugtext += 'Service limits';
           tlvs = extractTLVs(snac);
-          if (!self._state.servicesInfo[SNAC_SERVICES.LIST_MGMT]) {
-            self._state.servicesInfo[SNAC_SERVICES.LIST_MGMT] = {};
-            self._state.servicesInfo[SNAC_SERVICES.LIST_MGMT].maxContacts = tlvs[0x01];
-            self._state.servicesInfo[SNAC_SERVICES.LIST_MGMT].maxWatchers = tlvs[0x02];
-            self._state.servicesInfo[SNAC_SERVICES.LIST_MGMT].maxNotifications = tlvs[0x03];
+          if (!self._state.svcInfo[SNAC_SERVICES.LIST_MGMT]) {
+            self._state.svcInfo[SNAC_SERVICES.LIST_MGMT] = {};
+            self._state.svcInfo[SNAC_SERVICES.LIST_MGMT].maxContacts = tlvs[0x01][0];
+            self._state.svcInfo[SNAC_SERVICES.LIST_MGMT].maxWatchers = tlvs[0x02][0];
+            self._state.svcInfo[SNAC_SERVICES.LIST_MGMT].maxNotifications = tlvs[0x03][0];
           }
+          debugtext += ': maxContacts = ' + tlvs[0x01][0];
+          debugtext += ', maxWatchers = ' + tlvs[0x02][0];
+          debugtext += ', maxNotifications = ' + tlvs[0x03][0];
           self._dispatch(reqID);
         break;
         case 0x0B: // contact signed on or changed status notice
         case 0x0C: // contact signed off notice
           if (subtypeID === 0x0B) {
+            debugtext += 'Buddy ';
             var info = self._parseUserInfo(snac, idx), check, isSigningOn = false;
             check = self._SSIFindContact(info.name);
             if (check[1] !== -1) {
               if (self.contacts.list[check[0]].contacts[check[1]].status === USER_STATUSES.OFFLINE && info.flags !== 0x0000)
                 isSigningOn = true;
               self._mergeInfo(info.name, info);
-              //self.contacts.list[check[0]].contacts[check[1]] = extend(true, self.contacts.list[check[0]].contacts[check[1]], info);
               self.emit((isSigningOn ? 'contactonline' : 'contactupdate'), self.contacts.list[check[0]].contacts[check[1]]);
             }
+            debugtext += '(' + info.name + ') ' + (isSigningOn ? 'logged on' : 'changed their status');
           } else {
             var who = snac.toString('utf8', idx+1, idx+1+snac[idx]), warnLevel, check;
             idx+=1+snac[idx];
@@ -1239,71 +1539,187 @@ OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
               self.contacts.list[check[0]].contacts[check[1]].warnLevel = warnLevel;
               self.emit('contactoffline', self.contacts.list[check[0]].contacts[check[1]]);
             }
+            debugtext += '(' + who + ') logged off';
           }
         break;
         default:
-          debug('(' + conn.remoteAddress + ') Unknown subtype ID: 0x' + subtypeID.toString(16));
+          debugtext += 'Unknown (0x' + subtypeID.toString(16) + ')';
       }
     break;
     case SNAC_SERVICES.ICBM:
-      debug('(' + conn.remoteAddress + ') SNAC service type: ICBM');
+      debugtext += 'ICBM > ';
       switch (subtypeID) {
         case 0x01: // error
+          debugtext += 'Error';
           var code = (snac[idx++] << 8) + snac[idx++], msg = ICBM_ERRORS_TEXT[code] || 'Unknown error code received: ' + code,
               err = new Error(msg);
           err.code = code;
+          debugtext += ': ' + msg;
           self._dispatch(reqID, err);
         break;
         case 0x05: // limits response
-          if (!self._state.servicesInfo[SNAC_SERVICES.ICBM]) {
-            self._state.servicesInfo[SNAC_SERVICES.ICBM] = {};
-            self._state.servicesInfo[SNAC_SERVICES.ICBM].channel = (snac[idx++] << 8) + snac[idx++];
-            self._state.servicesInfo[SNAC_SERVICES.ICBM].flags = (snac[idx++] << 24) + (snac[idx++] << 16) + (snac[idx++] << 8) + snac[idx++];
-            self._state.servicesInfo[SNAC_SERVICES.ICBM].maxMsgLen = (snac[idx++] << 8) + snac[idx++];
-            self._state.servicesInfo[SNAC_SERVICES.ICBM].maxSenderWarn = (snac[idx++] << 8) + snac[idx++];
-            self._state.servicesInfo[SNAC_SERVICES.ICBM].maxReceiverWarn = (snac[idx++] << 8) + snac[idx++];
-            self._state.servicesInfo[SNAC_SERVICES.ICBM].minMsgInterval = (snac[idx++] << 8) + snac[idx++];
+          debugtext += 'Service limits';
+          if (!self._state.svcInfo[SNAC_SERVICES.ICBM]) {
+            self._state.svcInfo[SNAC_SERVICES.ICBM] = {};
+            self._state.svcInfo[SNAC_SERVICES.ICBM].channel = (snac[idx++] << 8) + snac[idx++];
+            self._state.svcInfo[SNAC_SERVICES.ICBM].flags = (snac[idx++] << 24) + (snac[idx++] << 16) + (snac[idx++] << 8) + snac[idx++];
+            self._state.svcInfo[SNAC_SERVICES.ICBM].maxMsgLen = (snac[idx++] << 8) + snac[idx++];
+            self._state.svcInfo[SNAC_SERVICES.ICBM].maxSenderWarn = (snac[idx++] << 8) + snac[idx++];
+            self._state.svcInfo[SNAC_SERVICES.ICBM].maxReceiverWarn = (snac[idx++] << 8) + snac[idx++];
+            self._state.svcInfo[SNAC_SERVICES.ICBM].minMsgInterval = (snac[idx++] << 8) + snac[idx++];
           }
+          debugtext += ': channel = ' + self._state.svcInfo[SNAC_SERVICES.ICBM].channel;
+          debugtext += ', flags = ' + self._state.svcInfo[SNAC_SERVICES.ICBM].flags;
+          debugtext += ', maxMsgLen = ' + self._state.svcInfo[SNAC_SERVICES.ICBM].maxMsgLen;
+          debugtext += ', maxSenderWarn = ' + self._state.svcInfo[SNAC_SERVICES.ICBM].maxSenderWarn;
+          debugtext += ', maxReceiverWarn = ' + self._state.svcInfo[SNAC_SERVICES.ICBM].maxReceiverWarn;
+          debugtext += ', minMsgInterval = ' + self._state.svcInfo[SNAC_SERVICES.ICBM].minMsgInterval;
           self._dispatch(reqID);
         break;
         case 0x07: // received a chat/im/file/dc message
-          var cookie1, cookie2, channel, senderLen, sender, senderWarnLevel;
-          cookie1 = (snac[idx++] << 24) + (snac[idx++] << 16) + (snac[idx++] << 8) + snac[idx++];
-          cookie2 = (snac[idx++] << 24) + (snac[idx++] << 16) + (snac[idx++] << 8) + snac[idx++];
+          debugtext += 'Incoming ';
+          var cookie, channel, sender, numFixedTLVs;
+          cookie = [snac[idx++], snac[idx++], snac[idx++], snac[idx++],
+                    snac[idx++], snac[idx++], snac[idx++], snac[idx++]];
           channel = (snac[idx++] << 8) + snac[idx++];
-          senderLen = snac[idx++];
-          sender = snac.toString('utf8', idx, idx+senderLen);
-          idx += senderLen;
-          senderWarnLevel = (snac[idx++] << 8) + snac[idx++];
-          if (channel === 1) { // "plain" text messages
-            var msgData, msgText/*, reqCapabs*/;
-            idx += 2;
-            tlvs = extractTLVs(snac, idx);
-            msgData = tlvs[2];
+          sender = self._parseUserInfo(snac, idx, true);
+          idx = sender[1];
+          sender = sender[0];
+          tlvs = extractTLVs(snac, idx);
+          if (channel === 1) { // normal IMs
+            debugtext += 'IM. Sender: ' + sys.inspect(sender.name);
+            var msgText, charset, msgData = tlvs[0x02], flags = 0, datetime;
             for (var i=0,len=msgData.length,fragID,fragLen; i<len;) {
-              fragID = msgData[i];
-              i+=2;
+              fragID = msgData[i++];
+              i++;
               fragLen = (msgData[i++] << 8) + msgData[i++];
-              if (fragID === 0x05) { // required capabilities array -- unknown values?
-                //reqCapabs = msgData.slice(i, i+fragLen);
+              if (fragID === 0x05) { // features -- constant?
+                //features = msgData.slice(i, i+fragLen);
                 i += fragLen;
               } else if (fragID === 0x01) { // message text
-                i += 4;
+                charset = (msgData[i++] << 8) + msgData[i++];
+                i += 2;
                 fragLen -= 4;
-                msgText = msgData.slice(i, i+fragLen);
+                msgText = msgData.toString('utf8', i, i+fragLen);
                 i += fragLen;
+                break;
               }
             }
-            self.emit('im', sender, msgText, senderWarnLevel);
-          }
+            if (tlvs[0x03])
+              flags |= ICBM_MSG_FLAGS.ACK;
+            if (tlvs[0x04])
+              flags |= ICBM_MSG_FLAGS.AWAY;
+            if (tlvs[0x06]) {
+              flags |= ICBM_MSG_FLAGS.OFFLINE;
+              if (tlvs[0x16]) // _should_ always be set for offline messages
+                datetime = new Date((tlvs[0x16][0] << 24) + (tlvs[0x16][1] << 16) + (tlvs[0x16][2] << 8) + tlvs[0x16][3]);
+            }
+            if (tlvs[0x08]) {
+              var len = (tlvs[0x08][0] << 24) + (tlvs[0x08][1] << 16) + (tlvs[0x08][2] << 8) + tlvs[0x08][3],
+                  type = (tlvs[0x08][4] << 8) + tlvs[0x08][5],
+                  hash = (tlvs[0x08][6] << 8) + tlvs[0x08][7], // a constant 2 bytes for a hash???
+                  datetime = (tlvs[0x08][8] << 24) + (tlvs[0x08][9] << 16) + (tlvs[0x08][10] << 8) + tlvs[0x08][11]
+              if (len)
+                flags |= ICBM_MSG_FLAGS.HAS_ICON;
+            }
+            if (tlvs[0x09]) {
+              flags |= ICBM_MSG_FLAGS.REQ_ICON;
+              self._sendIcon(sender.name); // automatically send our icon if we have one set
+            }
+            self.emit('im', msgText, sender, flags, datetime);
+          } else if (channel === 2) { // special messages
+            debugtext += 'Rendezvous';
+            var msgData = tlvs[0x05], i=0;
+            if (msgData) {
+              var status = (msgData[i++] << 8) + msgData[i++], // one of ICBM_RENDEZVOUS_STATUSES
+                  rndvCookie = [msgData[i++], msgData[i++], msgData[i++], msgData[i++],
+                               msgData[i++], msgData[i++], msgData[i++], msgData[i++]];
+              if (arraysEqual(rndvCookie, cookie)) { // cookie values _should_ match
+                var type = msgData.slice(idx, idx+16).toArray(), info = {};
+                idx += 16;
+                tlvs = extractTLVs(msgData, idx);
+                if (tlvs[0x02] && tlvs[0x02].length === 4)
+                  info.proxyIP = '' + tlvs[0x02][0] + '.' + tlvs[0x02][1] + '.' + tlvs[0x02][2] + '.' + tlvs[0x02][3];
+                if (tlvs[0x03] && tlvs[0x03].length === 4)
+                  info.clientIP = '' + tlvs[0x03][0] + '.' + tlvs[0x03][1] + '.' + tlvs[0x03][2] + '.' + tlvs[0x03][3];
+                if (tlvs[0x04] && tlvs[0x04].length === 4)
+                  info.verifiedIP = '' + tlvs[0x04][0] + '.' + tlvs[0x04][1] + '.' + tlvs[0x04][2] + '.' + tlvs[0x04][3];
+                if (tlvs[0x05])
+                  info.port = (tlvs[0x05][0] << 8) + tlvs[0x05][1];
+                if (tlvs[0x0A]) {
+                  info.reqNum = (tlvs[0x0A][0] << 8) + tlvs[0x0A][1];
+                  // reqNum === 1 -> Initial file xfer request for no/stage 1 proxy
+                  // reqNum === 2 -> reply request for stage 2 proxy (receiver wants to use a proxy)
+                  // reqNum === 3 -> third request -- only for stage 3 proxy
+                }
+                if (tlvs[0x0B])
+                  info.err = (tlvs[0x0B][0] << 8) + tlvs[0x0B][1];
+                if (tlvs[0x0C])
+                  info.msg = tlvs[0x0C].toString();
+                if (tlvs[0x0D])
+                  info.charset = tlvs[0x0D].toString();
+                if (tlvs[0x0E])
+                  info.lang = tlvs[0x0E].toString();
+                if (tlvs[0x10])
+                  info.useProxy = true;
+
+                if (tlvs[0x2711]) {
+                  if (arraysEqual(type, CAPABILITIES.SEND_FILE)) {
+                    if (tlvs[0x2712])
+                      info.fnameCharset = tlvs[0x2712].toString(); // i.e. 'us-ascii'
+                    var fileInfo = self._incomingFile(info, tlvs[0x2711]);
+                    //debug('Incoming file transfer request ... Sender: ' + sys.inspect(sender) + ' File info: ' + sys.inspect(fileInfo));
+                    debugtext += ': File xfer request. Sender: ' + sys.inspect(sender.name) + ' File info: ' + sys.inspect(fileInfo);
+                    self.emit('filexfer', sender.name, fileInfo);
+                  } else if (arraysEqual(type, CAPABILITIES.BUDDY_ICON)) {
+                    var iconInfo = self._incomingIcon(info, tlvs[0x2711]);
+                    //debug('Incoming icon data ... Sender: ' + sys.inspect(sender) + ' Icon info: ' + sys.inspect(iconInfo));
+                    debugtext += ': Icon data. Sender: ' + sys.inspect(sender.name) + ' Icon info: ' + sys.inspect(iconInfo);
+                    self.emit('icon', sender.name, iconInfo.data);
+                  } else if (arraysEqual(type, CAPABILITIES.CHAT)) {
+                    var roomInfo = self._incomingChat(info, tlvs[0x2711]);
+                    //debug('Incoming chat invitation ... Sender: ' + sys.inspect(sender) + ' Chat room info: ' + sys.inspect(roomInfo));
+                    debugtext += ': Chat invitation. Sender: ' + sys.inspect(sender.name) + ' Chat room info: ' + sys.inspect(roomInfo);
+                    self.emit('chatrequest', sender.name, roomInfo);
+                  } else if (arraysEqual(type, CAPABILITIES.SEND_CONTACT_LIST)) {
+                    var list = self._incomingList(info, tlvs[0x2711]);
+                    //debug('Incoming contact list ... Sender: ' + sys.inspect(sender) + ' List: ' + sys.inspect(list));
+                    debugtext += ': Contact list. Sender: ' + sys.inspect(sender.name) + ' List: ' + sys.inspect(list);
+                    self.emit('contactlist', sender.name, list);
+                  }
+                }
+              }
+            }
+          } else if (channel === 4)
+            debugtext += 'Unknown (channel 4). Sender: ' + sys.inspect(sender.name);
         break;
         case 0x08: // warn request ACK
+          debugtext += 'Warn request ACK';
           self._dispatch(reqID, undefined, (snac[idx++] << 8) + snac[idx++], (snac[idx++] << 8) + snac[idx++]);
         break;
-        case 0x0c: // (optional) ack for sendIM
+        case 0x0A: // someone tried to send us a message but it wasn't able to be delivered
+          debugtext += 'Missed message(s)';
+          var channel, sender, numMissed, reason, len = snac.length;
+          while (idx < len) {
+            channel = (snac[idx++] << 8) + snac[idx++];
+            sender = self._parseUserInfo(snac, idx, true);
+            idx = sender[0];
+            sender = sender[1];
+            numMissed = (snac[idx++] << 8) + snac[idx++];
+            reason = (snac[idx++] << 8) + snac[idx++];
+            self.emit('missed', sender, numMissed, reason, channel);
+          }
+        break;
+        case 0x0B:
+          debugtext += '0x0B -- TODO';
+          // TODO
+        break;
+        case 0x0C: // (optional) ack for sendIM
+          debugtext += 'IM sent ACK';
           self._dispatch(reqID);
         break;
         case 0x14: // typing notification
+          debugtext += 'Typing notification';
           idx += 10;
           var who = snac.toString('utf8', idx+1, idx+1+snac[idx]), notifyType;
           idx += 1+snac[idx];
@@ -1311,70 +1727,268 @@ OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
           self.emit('typing', who, notifyType);
         break;
         default:
-          debug('(' + conn.remoteAddress + ') Unknown subtype ID: 0x' + subtypeID.toString(16));
+          debugtext += 'Unknown (0x' + subtypeID.toString(16) + ')';
       }
     break;
     case SNAC_SERVICES.INVITATION:
-      debug('(' + conn.remoteAddress + ') SNAC service type: INVITATION');
+      debugtext += 'INVITATION > ';
+      debugtext += 'Unknown (0x' + subtypeID.toString(16) + ')';
     break;
     case SNAC_SERVICES.ADMIN:
-      debug('(' + conn.remoteAddress + ') SNAC service type: ADMIN');
+      debugtext += 'ADMIN > ';
+      debugtext += 'Unknown (0x' + subtypeID.toString(16) + ')';
     break;
     case SNAC_SERVICES.POPUP:
-      debug('(' + conn.remoteAddress + ') SNAC service type: POPUP');
+      debugtext += 'POPUP > ';
       switch (subtypeID) {
         case 0x01: // error
+          debugtext += 'Error';
         break;
         case 0x02: // popup message
+          debugtext += 'URL: ';
           tlvs = extractTLVs(snac);
           var url = (tlvs[2] ? tlvs[2].toString() : undefined),
               msg = (tlvs[1] ? tlvs[1].toString() : undefined);
+          debugtext += url + ', Message: ' + msg;
           self.emit('popup', msg, url);
         break;
         default:
-          debug('(' + conn.remoteAddress + ') Unknown subtype ID: 0x' + subtypeID.toString(16));
+          debugtext += 'Unknown (0x' + subtypeID.toString(16) + ')';
       }
     break;
     case SNAC_SERVICES.PRIVACY_MGMT:
-      debug('(' + conn.remoteAddress + ') SNAC service type: PRIVACY_MGMT');
+      debugtext += 'PRIVACY_MGMT > ';
       switch (subtypeID) {
         case 0x03: // limits response
+          debugtext += 'Service limits';
           tlvs = extractTLVs(snac);
-          if (!self._state.servicesInfo[SNAC_SERVICES.PRIVACY_MGMT]) {
-            self._state.servicesInfo[SNAC_SERVICES.PRIVACY_MGMT] = {};
-            self._state.servicesInfo[SNAC_SERVICES.PRIVACY_MGMT].maxVisibleSize = (tlvs[0x01][0] << 8) + tlvs[0x01][1];
-            self._state.servicesInfo[SNAC_SERVICES.PRIVACY_MGMT].maxInvisibleSize = (tlvs[0x02][0] << 8) + tlvs[0x02][1];
+          if (!self._state.svcInfo[SNAC_SERVICES.PRIVACY_MGMT]) {
+            self._state.svcInfo[SNAC_SERVICES.PRIVACY_MGMT] = {};
+            self._state.svcInfo[SNAC_SERVICES.PRIVACY_MGMT].maxVisibleSize = (tlvs[0x01][0] << 8) + tlvs[0x01][1];
+            self._state.svcInfo[SNAC_SERVICES.PRIVACY_MGMT].maxInvisibleSize = (tlvs[0x02][0] << 8) + tlvs[0x02][1];
+          }
+          debugtext += ': maxVisibleSize = ' + ((tlvs[0x01][0] << 8) + tlvs[0x01][1]);
+          debugtext += ', maxInivisibleSize = ' + ((tlvs[0x02][0] << 8) + tlvs[0x02][1]);
+          self._dispatch(reqID);
+        break;
+        default:
+          debugtext += 'Unknown (0x' + subtypeID.toString(16) + ')';
+      }
+    break;
+    case SNAC_SERVICES.USAGE_STATS:
+      debugtext += 'USAGE_STATS > ';
+      debugtext += 'Unknown (0x' + subtypeID.toString(16) + ')';
+    break;
+    case SNAC_SERVICES.CHAT_NAV:
+      debugtext += 'CHAT_NAV >';
+      switch (subtypeID) {
+        case 0x01:
+          debugtext += ' Error';
+          var code = (snac[idx++] << 8) + snac[idx++], code2,
+              msg = 'Could not join chat room: ', err;
+          tlvs = extractTLVs(snac, idx);
+          if (tlvs[0x08]) {
+            code2 = (tlvs[0x08][0] << 8) + tlvs[0x08][1];
+            msg += 'Invalid chat room name';
+          } else
+            msg += 'Unknown error';
+          msg += ' (code: ' + code + ', code2: ' + code2 + ')';
+          err = new Error(msg);
+          err.code = code;
+          err.code2 = code2;
+          debugtext += ': ' + msg;
+          self._dispatch(reqID, err);
+        break;
+        case 0x09: // single response for any request for this service ... UGH!
+          tlvs = extractTLVs(snac);
+          if (tlvs[0x02]) {
+            debugtext += ' Service limits';
+            if (!self._state.svcInfo[SNAC_SERVICES.CHAT_NAV])
+              self._state.svcInfo[SNAC_SERVICES.CHAT_NAV] = {};
+            self._state.svcInfo[SNAC_SERVICES.CHAT_NAV].maxRooms = tlvs[0x02][0];
+            debugtext += ': maxRooms = ' + tlvs[0x02][0];
+            debugtext += ';';
+          }
+          if (tlvs[0x03]) { // exchange info
+            debugtext += ' Exchange info';
+            if (!self._state.svcInfo[SNAC_SERVICES.CHAT_NAV].exchanges)
+              self._state.svcInfo[SNAC_SERVICES.CHAT_NAV].exchanges = {};
+            if (!Array.isArray(tlvs[0x03]))
+              tlvs[0x03] = [tlvs[0x03]];
+            for (var i=0,len=tlvs[0x03].length,id,exgTLVs; i<len; i++) {
+              id = (tlvs[0x03][i][0] << 8) + tlvs[0x03][i][1];
+              if (!self._state.svcInfo[SNAC_SERVICES.CHAT_NAV].exchanges[id])
+                self._state.svcInfo[SNAC_SERVICES.CHAT_NAV].exchanges[id] = {};
+              exgTLVs = extractTLVs(tlvs[0x03][i], 4);
+              if (exgTLVs[0x02])
+                self._state.svcInfo[SNAC_SERVICES.CHAT_NAV].exchanges[id].forClass = (exgTLVs[0x02][0] << 8) + exgTLVs[0x02][1];
+              if (exgTLVs[0x03])
+                self._state.svcInfo[SNAC_SERVICES.CHAT_NAV].exchanges[id].maxRooms = exgTLVs[0x03][0];
+              if (exgTLVs[0xC9])
+                self._state.svcInfo[SNAC_SERVICES.CHAT_NAV].exchanges[id].flags = (exgTLVs[0xC9][0] << 8) + exgTLVs[0xC9][1];
+              if (exgTLVs[0xD3])
+                self._state.svcInfo[SNAC_SERVICES.CHAT_NAV].exchanges[id].description = exgTLVs[0xD3].toString();
+              if (exgTLVs[0xD5])
+                self._state.svcInfo[SNAC_SERVICES.CHAT_NAV].exchanges[id].createPerms = exgTLVs[0xD5][0];
+              if (exgTLVs[0xD6])
+                self._state.svcInfo[SNAC_SERVICES.CHAT_NAV].exchanges[id].charset1 = exgTLVs[0xD6].toString();
+              if (exgTLVs[0xD7])
+                self._state.svcInfo[SNAC_SERVICES.CHAT_NAV].exchanges[id].lang1 = exgTLVs[0xD7].toString();
+              if (exgTLVs[0xD8])
+                self._state.svcInfo[SNAC_SERVICES.CHAT_NAV].exchanges[id].charset2 = exgTLVs[0xD8].toString();
+              if (exgTLVs[0xD9])
+                self._state.svcInfo[SNAC_SERVICES.CHAT_NAV].exchanges[id].lang2 = exgTLVs[0xD9].toString();
+            }
+            //debug('exchange info: ' + sys.inspect(self._state.svcInfo[SNAC_SERVICES.CHAT_NAV].exchanges, false, 4));
+            debugtext += ';';
+          }
+          if (tlvs[0x04]) { // room info
+            debugtext += ' Room info';
+            var i = 0, roomInfo = {}, roomTLVs;
+            roomInfo.exchange = (tlvs[0x04][i++] << 8) + tlvs[0x04][i++];
+            roomInfo.cookie = tlvs[0x04].slice(++i, i+tlvs[0x04][i-1]).toArray();
+            i += tlvs[0x04][i-1];
+            roomInfo.instance = (tlvs[0x04][i++] << 8) + tlvs[0x04][i++];
+            roomInfo.detailLevel = tlvs[0x04][i++];
+            i += 2;
+            roomTLVs = extractTLVs(tlvs[0x04], i);
+            if (roomTLVs[0x6A])
+              roomInfo.fqn = roomTLVs[0x6A].toString();
+            if (roomTLVs[0xC9])
+              roomInfo.flags = (roomTLVs[0xC9][0] << 8) + roomTLVs[0xC9][1];
+            if (roomTLVs[0xCA])
+              roomInfo.created = (roomTLVs[0xCA][0] << 24) + (roomTLVs[0xCA][1] << 16) + (roomTLVs[0xCA][2] << 8) + roomTLVs[0xCA][3];
+            if (roomTLVs[0xD1])
+              roomInfo.maxMsgLen = (roomTLVs[0xD1][0] << 8) + roomTLVs[0xD1][1];
+            if (roomTLVs[0xD2])
+              roomInfo.maxUsers = (roomTLVs[0xD2][0] << 8) + roomTLVs[0xD2][1];
+            if (roomTLVs[0xD3])
+              roomInfo.name = roomTLVs[0xD3].toString();
+            if (roomTLVs[0xD5])
+              roomInfo.createPerms = roomTLVs[0xD5][0];
+            if (roomTLVs[0xD6])
+              roomInfo.charset1 = roomTLVs[0xD6].toString();
+            if (roomTLVs[0xD7])
+              roomInfo.lang1 = roomTLVs[0xD7].toString();
+            if (roomTLVs[0xD8])
+              roomInfo.charset2 = roomTLVs[0xD8].toString();
+            if (roomTLVs[0xD9])
+              roomInfo.lang2 = roomTLVs[0xD9].toString();
+            roomInfo.users = {};
+
+            if (self._state.chatrooms[roomInfo.name] &&
+                self._state.chatrooms[roomInfo.name].roomInfo)
+              extend(true, self._state.chatrooms[roomInfo.name].roomInfo, roomInfo);
+            else {
+              self._state.chatrooms[roomInfo.name] = conn;
+              conn.roomInfo = roomInfo;
+            }
+            self._dispatch(reqID, undefined, roomInfo);
+            return;
           }
           self._dispatch(reqID);
         break;
         default:
-          debug('(' + conn.remoteAddress + ') Unknown subtype ID: 0x' + subtypeID.toString(16));
+          debugtext += ' Unknown (0x' + subtypeID.toString(16) + ')';
       }
     break;
-    case SNAC_SERVICES.USAGE_STATS:
-      debug('(' + conn.remoteAddress + ') SNAC service type: USAGE_STATS');
-    break;
-    case SNAC_SERVICES.CHAT_NAV:
-      debug('(' + conn.remoteAddress + ') SNAC service type: CHAT_NAV');
-    break;
     case SNAC_SERVICES.CHAT:
-      debug('(' + conn.remoteAddress + ') SNAC service type: CHAT');
+      debugtext += 'CHAT > ';
+      switch (subtypeID) {
+        case 0x02:
+          debugtext += 'General room info -- Purposefully ignored';
+          /*var roomInfo = {}, len, tlvcount, tlvs;
+          roomInfo.exchange = (snac[idx++] << 8) + snac[idx++];
+          len = snac[idx++];
+          roomInfo.name = snac.slice(idx, idx+len).toString();
+          idx += len;
+          roomInfo.instance = (snac[idx++] << 8) + snac[idx++];
+          roomInfo.detailLevel = snac[idx++];
+          tlvcount = (snac[idx++] << 8) + snac[idx++];
+          tlvs = extractTLVs(snac, idx, tlvcount);
+
+          if (tlvs[0xD1])
+            roomInfo.maxMsgLen = (tlvs[0xD1][0] << 8) + tlvs[0xD1][1];
+
+          if (self._state.chatrooms[roomInfo.name] &&
+              self._state.chatrooms[roomInfo.name].roomInfo)
+            extend(true, self._state.chatrooms[roomInfo.name].roomInfo, roomInfo);
+          else {
+            self._state.chatrooms[roomInfo.name] = conn;
+            conn.roomInfo = roomInfo;
+          }*/
+        break;
+        case 0x03:
+          debugtext += 'User(s) joined chat room (' + conn.roomInfo.name + '): ';
+        case 0x04:
+          var isJoin = (subtypeID === 0x03);
+          if (!isJoin)
+            debugtext += 'User(s) left a chat room (' + conn.roomInfo.name + '): ';
+          var users = [], result;
+          while (idx < snac.length) {
+            result = self._parseUserInfo(snac, idx, true);
+            users.push(result[0]);
+            idx = result[1];
+          }
+          debugtext += users.map(function(u){return u.name}).join(', ');
+          self.emit('chatusers' + (isJoin ? 'join' : 'leave'), conn.roomInfo.name, users);
+        break;
+        case 0x06:
+          debugtext += 'Chat room message';
+          var cookie, chan, sender, message, isWhisper;
+          cookie = [snac[idx++], snac[idx++], snac[idx++], snac[idx++],
+                    snac[idx++], snac[idx++], snac[idx++], snac[idx++]];
+          chan = (snac[idx++] << 8) + snac[idx++];
+          if (chan === 3) {
+            var tlvs = extractTLVs(snac, idx);
+            isWhisper = (typeof tlvs[0x01] === undefined);
+            if (tlvs[0x03])
+              sender = self._parseUserInfo(tlvs[0x03]);
+            if (tlvs[0x05]) {
+              message = {};
+              var msgTLVs = extractTLVs(tlvs[0x05], 0);
+              if (msgTLVs[0x02])
+                message.charset = msgTLVs[0x02].toString();
+              if (msgTLVs[0x03])
+                message.lang = msgTLVs[0x03].toString();
+              if (msgTLVs[0x01])
+                message.text = msgTLVs[0x01].toString();
+            }
+            debugtext += ' on (' + conn.roomInfo.name + ') by (' + sender.name + '): ' + message.text;
+            self.emit('chatmsg', conn.roomInfo.name, sender, message.text);
+          } else
+            debugtext += ' on unexpected channel (' + chan + ')';
+        break;
+        case 0x08:
+          debugtext += 'Warning level changed for chat room';
+        break;
+        case 0x09:
+          debugtext += 'Chat room error';
+        break;
+        default:
+          debugtext += 'Unknown (0x' + subtypeID.toString(16) + ')';
+      }
     break;
     case SNAC_SERVICES.DIR_SEARCH:
-      debug('(' + conn.remoteAddress + ') SNAC service type: DIR_SEARCH');
+      debugtext += 'DIR_SEARCH > ';
+      debugtext += 'Unknown (0x' + subtypeID.toString(16) + ')';
     break;
     case SNAC_SERVICES.BART:
-      debug('(' + conn.remoteAddress + ') SNAC service type: BART');
+      debugtext += 'BART > ';
       switch (subtypeID) {
         case 0x01: // error
+          debugtext += 'Error';
           var code = (snac[idx++] << 8) + snac[idx++], msg = GLOBAL_ERRORS_TEXT[code] || 'Unknown error code received: ' + code,
               err = new Error(msg);
           err.code = code;
+          debugtext += ': ' + msg;
           self._dispatch(reqID, err);
         break;
         case 0x03: // icon upload ack
+          debugtext += 'Icon upload ACK';
         break;
         case 0x05: // icon/media response
+          debugtext += 'Incoming buddy icon for ';
           var who = snac.toString('utf8', idx+1, idx+1+snac[idx]), flags, type, hash, len, icon;
           idx += 1+snac[idx];
           type = (snac[idx++] << 8) + snac[idx++];
@@ -1384,38 +1998,49 @@ OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
           idx += len;
           len = (snac[idx++] << 8) + snac[idx++];
           icon = snac.slice(idx, idx+len);
-          self._state.mediaCache[hash.toString('hex')] = icon;
+          debugtext += who;
           self.emit('icon', who, icon, (type === 0x0000 ? 'small' : 'normal'));
         break;
         default:
-          debug('(' + conn.remoteAddress + ') Unknown subtype ID: 0x' + subtypeID.toString(16));
+          debugtext += 'Unknown (0x' + subtypeID.toString(16) + ')';
       }
     break;
     case SNAC_SERVICES.SSI:
-      debug('(' + conn.remoteAddress + ') SNAC service type: SSI');
+      debugtext += 'SSI > ';
       switch (subtypeID) {
         case 0x01: // error
+          debugtext += 'Error';
           var code = (snac[idx++] << 8) + snac[idx++], msg = GLOBAL_ERRORS_TEXT[code] || 'Unknown error code received: ' + code,
               err = new Error(msg);
           err.code = code;
+          debugtext += ': ' + msg;
           self._dispatch(reqID, err);
         break;
         case 0x03: // limits response
+          debugtext += 'Service limits';
           var tlvIdx = 0;
           tlvs = extractTLVs(snac);
-          if (!self._state.servicesInfo[SNAC_SERVICES.SSI]) {
-            self._state.servicesInfo[SNAC_SERVICES.SSI] = {};
-            self._state.servicesInfo[SNAC_SERVICES.SSI].maxContacts = (tlvs[0x04][tlvIdx++] << 8) + tlvs[0x04][tlvIdx++];
-            self._state.servicesInfo[SNAC_SERVICES.SSI].maxGroups = (tlvs[0x04][tlvIdx++] << 8) + tlvs[0x04][tlvIdx++];
-            self._state.servicesInfo[SNAC_SERVICES.SSI].maxPermitContacts = (tlvs[0x04][tlvIdx++] << 8) + tlvs[0x04][tlvIdx++];
-            self._state.servicesInfo[SNAC_SERVICES.SSI].maxDenyContacts = (tlvs[0x04][tlvIdx++] << 8) + tlvs[0x04][tlvIdx++];
-            self._state.servicesInfo[SNAC_SERVICES.SSI].maxBitmasks = (tlvs[0x04][tlvIdx++] << 8) + tlvs[0x04][tlvIdx++];
-            self._state.servicesInfo[SNAC_SERVICES.SSI].maxPresenceFields = (tlvs[0x04][tlvIdx++] << 8) + tlvs[0x04][tlvIdx++];
-            self._state.servicesInfo[SNAC_SERVICES.SSI].maxIgnores = (tlvs[0x04][28] << 8) + tlvs[0x04][29];
+          if (!self._state.svcInfo[SNAC_SERVICES.SSI]) {
+            self._state.svcInfo[SNAC_SERVICES.SSI] = {};
+            self._state.svcInfo[SNAC_SERVICES.SSI].maxContacts = (tlvs[0x04][tlvIdx++] << 8) + tlvs[0x04][tlvIdx++];
+            self._state.svcInfo[SNAC_SERVICES.SSI].maxGroups = (tlvs[0x04][tlvIdx++] << 8) + tlvs[0x04][tlvIdx++];
+            self._state.svcInfo[SNAC_SERVICES.SSI].maxPermitContacts = (tlvs[0x04][tlvIdx++] << 8) + tlvs[0x04][tlvIdx++];
+            self._state.svcInfo[SNAC_SERVICES.SSI].maxDenyContacts = (tlvs[0x04][tlvIdx++] << 8) + tlvs[0x04][tlvIdx++];
+            self._state.svcInfo[SNAC_SERVICES.SSI].maxBitmasks = (tlvs[0x04][tlvIdx++] << 8) + tlvs[0x04][tlvIdx++];
+            self._state.svcInfo[SNAC_SERVICES.SSI].maxPresenceFields = (tlvs[0x04][tlvIdx++] << 8) + tlvs[0x04][tlvIdx++];
+            self._state.svcInfo[SNAC_SERVICES.SSI].maxIgnores = (tlvs[0x04][28] << 8) + tlvs[0x04][29];
           }
+          debugtext += ': maxContacts = ' + self._state.svcInfo[SNAC_SERVICES.SSI].maxContacts;
+          debugtext += ', maxGroups = ' + self._state.svcInfo[SNAC_SERVICES.SSI].maxGroups;
+          debugtext += ', maxPermitContacts = ' + self._state.svcInfo[SNAC_SERVICES.SSI].maxPermitContacts;
+          debugtext += ', maxDenyContacts = ' + self._state.svcInfo[SNAC_SERVICES.SSI].maxDenyContacts;
+          debugtext += ', maxBitmasks = ' + self._state.svcInfo[SNAC_SERVICES.SSI].maxBitmasks;
+          debugtext += ', maxPresenceFields = ' + self._state.svcInfo[SNAC_SERVICES.SSI].maxPresenceFields;
+          debugtext += ', maxIgnores = ' + self._state.svcInfo[SNAC_SERVICES.SSI].maxIgnores;
           self._dispatch(reqID);
         break;
         case 0x06: // response to contact list request -- should only happen once (upon login)
+          debugtext += 'My buddy list';
           if (self._state.SSI.activated)
             break;
           idx++; // skip SSI protocol version number for now
@@ -1516,6 +2141,7 @@ OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
           }
         break;
         case 0x0E: // SSI modification ack (add/delete/other modification)
+          debugtext += 'Modification ACK';
           var result = (snac[idx++] << 8) + snac[idx++];
           if (result === SSI_ACK_RESULTS.SUCCESS)
             self._dispatch(reqID);
@@ -1526,24 +2152,30 @@ OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
           }
         break;
         case 0x13: // 'you were added' message
+          debugtext += 'You were added to the buddy list of ';
           var who = snac.toString('utf8', idx+1, idx+1+snac[idx]);
+          debugtext += who;
           self.emit('added', who);
         break;
         case 0x19: // authorization request
+          debugtext += 'Authorization request';
           // use SSI (0x13) 0x1A to send reply
         break;
         case 0x1B: // authorization reply
+          debugtext += 'Authorization reply';
         break;
         default:
-          debug('(' + conn.remoteAddress + ') Unknown subtype ID: 0x' + subtypeID.toString(16));
+          debugtext += 'Unknown (0x' + subtypeID.toString(16) + ')';
       }
     break;
     case SNAC_SERVICES.ICQ_EXT:
-      debug('(' + conn.remoteAddress + ') SNAC service type: ICQ_EXT');
+      debugtext += 'ICQ_EXT > ';
+      debugtext += 'Unknown (0x' + subtypeID.toString(16) + ')';
     break;
     default:
-      debug('(' + conn.remoteAddress + ') Unknown SNAC service ID: 0x' + serviceID.toString(16));
+      debugtext += 'UNKNOWN (0x' + serviceID.toString(16) + ')';
   }
+  debug(debugtext);
 };
 
 OscarConnection.prototype._mergeInfo = function(who, info) {
@@ -1636,10 +2268,6 @@ OscarConnection.prototype._parseUserInfo = function(data, idx, skipExtra) {
   tlvs = extractTLVs(data, idx, numTLVs);
   idx = tlvs[1];
   tlvs = tlvs[0];
-  // I've noticed that at least for self user info, AOL decided for some reason to bork their
-  // user info response and essentially append another (partial) user info response starting
-  // with the screen name length. In this case, we simply skip the stuff we already have and
-  // grab what we don't. I think the extra sets of TLVs may represent each instance of the user?
   if (!skipExtra && idx < data.length) {
     idx += 1+data[idx]+2;
     numTLVs = (data[idx] << 8) + data[idx+1];
@@ -1742,8 +2370,6 @@ OscarConnection.prototype._parseUserInfo = function(data, idx, skipExtra) {
           }
         }
       }
-      if (info.icons && this._options.other.autoCacheIcons)
-        this._cacheIcons(info.name, info.icons);
     }
   }
   if (tlvs[0x0026])
@@ -1759,7 +2385,10 @@ OscarConnection.prototype._parseUserInfo = function(data, idx, skipExtra) {
     return info;
 };
 
-OscarConnection.prototype._cacheIcons = function(who, hashes, cb) {
+OscarConnection.prototype._downloadIcons = function(who, hashes, skipCheck, cb) {
+  cb = arguments[arguments.length-1];
+  if (typeof skipCheck === 'function')
+    skipCheck = false;
   var self = this;
   var newHashes = [];
   if (!Array.isArray(hashes)) {
@@ -1768,89 +2397,118 @@ OscarConnection.prototype._cacheIcons = function(who, hashes, cb) {
     else
       hashes = [hashes];
   }
-  // check for duplicate items in the queue/hashes and already cached items
+  /*
+  // check for duplicate items
   for (var i=0,hlen=hashes.length,found,hexhash; i<hlen; i++) {
     hexhash = (typeof hashes[i].data !== 'string' ? toHexStr(hashes[i].data) : hashes[i].data);
-    if (typeof self._state.mediaCache[hexhash] === 'undefined') {
-      found = (self._state.iconQueue.indexOf(hexhash) > -1);
-      if (!found) {
-        for (var j=0,nhlen=newHashes.length; j<nhlen; j++) {
-          if ((typeof newHashes[j].data !== 'string' ? toHexStr(newHashes[j].data) : newHashes[j].data) === hexhash) {
-            found = true;
-            break;
-          }
+    if (!found) {
+      for (var j=0,nhlen=newHashes.length; j<nhlen; j++) {
+        if ((typeof newHashes[j].data !== 'string' ? toHexStr(newHashes[j].data) : newHashes[j].data) === hexhash) {
+          found = true;
+          break;
         }
       }
-      if (!found) {
-        newHashes.push(hashes[i]);
-        self._state.iconQueue.push(hexhash);
-      }
     }
+    if (!found)
+      newHashes.push(hashes[i]);
   }
-  if (newHashes.length === 0)
+  if (newHashes.length === 0) {
+    if (typeof cb === 'function')
+      cb(new Error('No icons to get'));
     return;
+  }
 
-  // HACK: Use HTTP to fetch icons instead of from a second BOS server until the ECONNRESET issue with first server is resolved
+  // WORKAROUND: Use HTTP to download icons instead of from a second BOS server until the ECONNRESET issue is resolved
   var client = http.createClient('80', 'o.aimcdn.net');
   (function(toFetch) {
-    var hash = toFetch.pop(), strhash = (typeof hash.data !== 'string' ? toHexStr(hash.data) : hash.data), thisFn = this, url, dataLen;
-    dataLen = (typeof hash.data !== 'string' ? hash.data.length : hash.data.length/2);
-    url = '/e/1/' + (hash.flags < 16 ? '0' : '') + hash.flags.toString(16) + (dataLen < 16 ? '0' : '') + dataLen.toString(16) + strhash;
+    var hash = toFetch.pop(), strhash = (typeof hash.data !== 'string' ? toHexStr(hash.data) : hash.data),
+        thisFn = this, iconData, url, hashLen;
+    hashLen = (typeof hash.data !== 'string' ? hash.data.length : hash.data.length/2);
+    url = '/e/1/' + (hash.flags < 16 ? '0' : '') + hash.flags.toString(16) + (hashLen < 16 ? '0' : '') + hashLen.toString(16) + strhash;
     var req = client.request(url, { 'Host': 'o.aimcdn.net' });
     req.end();
     req.on('response', function (res) {
-      debug('Attempting to cache an icon for ' + who + ' (' + toFetch.length + ' left) ...');
+      debug('Attempting to download an icon for ' + who + ' ...');
       if (res.statusCode === 200) {
         res.on('data', function(data) {
-          if (!self._state.mediaCache[strhash])
-            self._state.mediaCache[strhash] = data;
-          else
-            self._state.mediaCache[strhash] = self._state.mediaCache[strhash].append(data);
+          iconData = (!iconData ? data : iconData.append(data));
         });
         res.on('end', function() {
-          self._state.iconQueue.splice(self._state.iconQueue.indexOf(hexhash), 1);
-          debug('Icon successfully cached for ' + who);
+          debug('Icon download successful for ' + who);
           process.nextTick(function() {
             if (typeof cb === 'function')
-              cb(undefined, self._state.mediaCache[strhash], (hash.type === 0x0000 ? 'small' : 'normal'));
+              cb(undefined, iconData, (hash.type === 0x0000 ? 'small' : 'normal'));
             else
-              self.emit('icon', who, self._state.mediaCache[strhash], (hash.type === 0x0000 ? 'small' : 'normal'));
+              self.emit('icon', who, iconData, (hash.type === 0x0000 ? 'small' : 'normal'));
           });
           if (toFetch.length)
             process.nextTick(function() { thisFn.call(toFetch); });
         });
       } else {
-        debug('Failed to fetch icon for ' + who + '. HTTP status === ' + res.statusCode);
-        cb(new Error('Got HTTP status ' + res.statusCode + ' while fetching icon for ' + who));
+        debug('Failed to download icon for ' + who + '. HTTP status === ' + res.statusCode);
+        if (typeof cb === 'function')
+          cb(new Error('No icon found'));
       }
     });
-  })(newHashes);
-  
-  // This is for obtaining icons via a (second) server supporting the BART family (0x10)
-  /*if (self._state.serviceMap[SNAC_SERVICES.BART]) {
-    debug('BART connection available ... caching ' + newHashes.length + ' icon(s) for \'' + who + '\' ....');
+  })(newHashes);*/
+
+  if (!skipCheck) {
+    for (var i=0,hlen=hashes.length,found,hexhash; i<hlen; i++) {
+      hexhash = (typeof hashes[i].data !== 'string' ? toHexStr(hashes[i].data) : hashes[i].data);
+      found = (typeof self._state.iconQueue[hexhash] !== undefined);
+      if (found && self._state.iconQueue[hexhash].users.indexOf(who) === -1)
+        self._state.iconQueue[hexhash].users.push(who);
+      if (!found) {
+        found = newHashes.some(function(h) { return ((typeof h.data !== 'string' ? toHexStr(h.data) : h.data) === hexhash); });
+        /*for (var j=0,nhlen=newHashes.length; j<nhlen; j++) {
+          if ((typeof newHashes[j].data !== 'string' ? toHexStr(newHashes[j].data) : newHashes[j].data) === hexhash) {
+            found = true;
+            break;
+          }
+        }*/
+      }
+      if (!found)
+        newHashes.push(hashes[i]);
+    }
+  } else
+    newHashes = hashes;
+  if (newHashes.length === 0) {
+    if (typeof cb === 'function')
+      cb(new Error('No icons to get or icons for ' + who + ' are already in the icon queue'));
+    return;
+  }
+
+  if (self._state.serviceMap[SNAC_SERVICES.BART]) {
+    debug('BART connection available ... retrieving ' + newHashes.length + ' icon(s) for \'' + who + '\' ....');
     var request = [who.length];
     request = request.concat(str2bytes(who));
     request.push(newHashes.length);
-    for (var i=0; i<newHashes.length; i++) {
+    for (var i=0,data; i<newHashes.length; i++) {
+      if (!Array.isArray(newHashes[i].data)) {
+        if (typeof newHashes[i].data === 'string')
+          data = newHashes[i].data.match(/.{1,2}/g).map(function(x) { return parseInt(x, 16); });
+        else
+          data = newHashes[i].data.toArray();
+      }
       request.push(newHashes[i].type >> 8 & 0xFF);
       request.push(newHashes[i].type & 0xFF);
       request.push(newHashes[i].flags);
       request.push(newHashes[i].data.length);
-      request = request.concat(newHashes[i].data.toArray());
+      request = request.concat(data);
     }
-    self._send(self._createFLAP(FLAP_CHANNELS.SNAC,
+    self._send(self._createFLAP(self._state.serviceMap[SNAC_SERVICES.BART], FLAP_CHANNELS.SNAC,
       self._createSNAC(SNAC_SERVICES.BART, 0x04, NO_FLAGS,
         request
       )
-    ), function(e) { delete self._state.iconQueue[who]; });
+    ), cb);
   } else {
     debug('No BART connection available -- adding ' + newHashes.length + ' icon retrieval(s) for ' + who + ' to the queue ...');
-    if (typeof self._state.iconQueue[who] === 'undefined')
-      self._state.iconQueue[who] = newHashes;
-    else
-      self._state.iconQueue[who] = self._state.iconQueue[who].concat(newHashes);
-  }*/
+    for (var i=0,hexhash; i<newHashes.length; i++) {
+      hexhash = (typeof newHashes[i].data === 'string' ? newHashes[i].data : toHexStr(newHashes[i].data));
+      if (typeof self._state.iconQueue[hexhash] === 'undefined')
+        self._state.iconQueue[hexhash] = { obj: newHashes[i], users: [who] };
+    }
+  }
 };
 
 OscarConnection.prototype._login = function(error, conn, loginCb, reentry) {
@@ -1866,11 +2524,9 @@ OscarConnection.prototype._login = function(error, conn, loginCb, reentry) {
     reentry = -1;
     if (self._state.isAOL) {
       // request salt from server for md5 hashing for password
-      self._send(conn, self._createFLAP(FLAP_CHANNELS.SNAC,
+      self._send(conn, self._createFLAP(conn, FLAP_CHANNELS.SNAC,
         self._createSNAC(SNAC_SERVICES.AUTH, 0x06, NO_FLAGS,
-                  self._createTLV(TLV_TYPES.SCREEN_NAME, self._options.connection.username)
-          /*.append(self._createTLV(0x4B))
-          .append(self._createTLV(0x5A))*/       // neither are sent for AIM in digsby
+          self._createTLV(TLV_TYPES.SCREEN_NAME, self._options.connection.username)
         )
       ), function(e, salt) { process.nextTick(function(){ self._login(e, conn, loginCb, reentry + 1, salt); }); });
     } else {
@@ -1879,42 +2535,42 @@ OscarConnection.prototype._login = function(error, conn, loginCb, reentry) {
           roastKeyLen = roastKey.length, roasted = [];
       for (var i=0,len=self._options.connection.password.length; i<len; i++)
         roasted.push(self._options.connection.password.charCodeAt(i) ^ roastKey[i%roastKeyLen]);
-      self._send(conn, self._createFLAP(FLAP_CHANNELS.CONN_NEW,
+      self._send(conn, self._createFLAP(conn, FLAP_CHANNELS.CONN_NEW,
                 self._createTLV(TLV_TYPES.SCREEN_NAME, self._options.connection.username)
-        .append(self._createTLV(TLV_TYPES.CLIENT_ID_STR, 'ICQ Inc. - Product of ICQ (TM).2003a.5.45.1.3777.85'))
-        .append(self._createTLV(TLV_TYPES.PASSWORD_NEW, roasted))
-        .append(self._createTLV(TLV_TYPES.CLIENT_ID, [0x01, 0x0A]))
-        .append(self._createTLV(TLV_TYPES.CLIENT_VER_MAJOR, [0x00, 0x05]))
-        .append(self._createTLV(TLV_TYPES.CLIENT_VER_MINOR, [0x00, 0x2D]))
-        .append(self._createTLV(TLV_TYPES.CLIENT_VER_LESSER, [0x00, 0x00]))
-        .append(self._createTLV(TLV_TYPES.CLIENT_VER_BUILD, [0x0E, 0xC1]))
-        .append(self._createTLV(TLV_TYPES.DISTRIB_NUM, [0x00, 0x00, 0x00, 0x55]))
-        .append(self._createTLV(TLV_TYPES.CLIENT_LANG, 'en'))
-        .append(self._createTLV(TLV_TYPES.CLIENT_COUNTRY, 'us'))
+        .concat(self._createTLV(TLV_TYPES.CLIENT_ID_STR, 'ICQ Inc. - Product of ICQ (TM).2003a.5.45.1.3777.85'))
+        .concat(self._createTLV(TLV_TYPES.PASSWORD_NEW, roasted))
+        .concat(self._createTLV(TLV_TYPES.CLIENT_ID, [0x01, 0x0A]))
+        .concat(self._createTLV(TLV_TYPES.CLIENT_VER_MAJOR, [0x00, 0x05]))
+        .concat(self._createTLV(TLV_TYPES.CLIENT_VER_MINOR, [0x00, 0x2D]))
+        .concat(self._createTLV(TLV_TYPES.CLIENT_VER_LESSER, [0x00, 0x00]))
+        .concat(self._createTLV(TLV_TYPES.CLIENT_VER_BUILD, [0x0E, 0xC1]))
+        .concat(self._createTLV(TLV_TYPES.DISTRIB_NUM, [0x00, 0x00, 0x00, 0x55]))
+        .concat(self._createTLV(TLV_TYPES.CLIENT_LANG, 'en'))
+        .concat(self._createTLV(TLV_TYPES.CLIENT_COUNTRY, 'us'))
       ), function(e, server, cookie) { process.nextTick(function(){ self._login(e, conn, loginCb, 1, server, cookie); }); });
     }
   } else {
     switch (reentry) {
-      case 0: // server sent us the salt ("key") for our md5 password hashing
+      case 0: // server sent us the salt ('key') for our md5 password hashing
         // TODO: truncate password if necessary
         var salt = arguments[4], hash = [], oldhash;
         oldhash = crypto.createHash('md5').update(salt).update(self._options.connection.password).update('AOL Instant Messenger (SM)').digest();
         for (var i=0,len=oldhash.length; i<len; i++)
           hash[i] = oldhash.charCodeAt(i);
-        self._send(conn, self._createFLAP(FLAP_CHANNELS.SNAC,
+        self._send(conn, self._createFLAP(conn, FLAP_CHANNELS.SNAC,
           self._createSNAC(SNAC_SERVICES.AUTH, 0x02, NO_FLAGS,
                     self._createTLV(TLV_TYPES.SCREEN_NAME, self._options.connection.username)
-            .append(self._createTLV(TLV_TYPES.CLIENT_ID_STR, 'AOL Instant Messenger, version 5.9.3702/WIN32'))
-            .append(self._createTLV(TLV_TYPES.PASSWORD_HASH, hash))
-            .append(self._createTLV(TLV_TYPES.CLIENT_ID, [0x01, 0x09]))
-            .append(self._createTLV(TLV_TYPES.CLIENT_VER_MAJOR, [0x00, 0x05]))
-            .append(self._createTLV(TLV_TYPES.CLIENT_VER_MINOR, [0x00, 0x09]))
-            .append(self._createTLV(TLV_TYPES.CLIENT_VER_LESSER, [0x00, 0x00]))
-            .append(self._createTLV(TLV_TYPES.CLIENT_VER_BUILD, [0x0E, 0x76]))
-            .append(self._createTLV(TLV_TYPES.DISTRIB_NUM, [0x00, 0x00, 0x01, 0x11]))
-            .append(self._createTLV(TLV_TYPES.CLIENT_LANG, 'en'))
-            .append(self._createTLV(TLV_TYPES.CLIENT_COUNTRY, 'us'))
-            .append(self._createTLV(TLV_TYPES.MULTI_CONN, [(self._options.connection.allowMultiLogin ? 0x01 : 0x03)]))
+            .concat(self._createTLV(TLV_TYPES.CLIENT_ID_STR, 'AOL Instant Messenger, version 5.9.3702/WIN32'))
+            .concat(self._createTLV(TLV_TYPES.PASSWORD_HASH, hash))
+            .concat(self._createTLV(TLV_TYPES.CLIENT_ID, [0x01, 0x09]))
+            .concat(self._createTLV(TLV_TYPES.CLIENT_VER_MAJOR, [0x00, 0x05]))
+            .concat(self._createTLV(TLV_TYPES.CLIENT_VER_MINOR, [0x00, 0x09]))
+            .concat(self._createTLV(TLV_TYPES.CLIENT_VER_LESSER, [0x00, 0x00]))
+            .concat(self._createTLV(TLV_TYPES.CLIENT_VER_BUILD, [0x0E, 0x76]))
+            .concat(self._createTLV(TLV_TYPES.DISTRIB_NUM, [0x00, 0x00, 0x01, 0x11]))
+            .concat(self._createTLV(TLV_TYPES.CLIENT_LANG, 'en'))
+            .concat(self._createTLV(TLV_TYPES.CLIENT_COUNTRY, 'us'))
+            .concat(self._createTLV(TLV_TYPES.MULTI_CONN, [(self._options.connection.allowMultiLogin ? 0x01 : 0x03)]))
           )
         ), function(e, server, cookie) { process.nextTick(function(){ self._login(e, conn, loginCb, reentry + 1, server, cookie); }); });
       break;
@@ -1923,7 +2579,7 @@ OscarConnection.prototype._login = function(error, conn, loginCb, reentry) {
         debug('Connecting to BOS server @ ' + server + ':' + port);
         conn.authCookie = arguments[5];
         conn.isTransferring = true;
-        conn.end();
+        //conn.end();
         conn.destroy();
         process.nextTick(function() {
           conn.tmrConn = setTimeout(self._fnTmrConn, self._options.connection.connTimeout, loginCb);
@@ -1931,8 +2587,8 @@ OscarConnection.prototype._login = function(error, conn, loginCb, reentry) {
         });
       break;
       case 2: // server asked us for our auth cookie
-        self._send(conn, self._createFLAP(FLAP_CHANNELS.CONN_NEW,
-          [0x00, 0x00, 0x00, 0x01].concat(self._createTLV(TLV_TYPES.AUTH_COOKIE, conn.authCookie, true))
+        self._send(conn, self._createFLAP(conn, FLAP_CHANNELS.CONN_NEW,
+          [0x00, 0x00, 0x00, 0x01].concat(self._createTLV(TLV_TYPES.AUTH_COOKIE, conn.authCookie))
         ), function(e) { process.nextTick(function(){self._login(e, conn, loginCb, reentry + 1);}); });
       break;
       case 3: // server sent us their list of supported services
@@ -1944,21 +2600,21 @@ OscarConnection.prototype._login = function(error, conn, loginCb, reentry) {
         if (services.indexOf(SNAC_SERVICES.GENERIC) === -1)
           services.unshift(SNAC_SERVICES.GENERIC);
         for (var i=0,len=services.length; i<len; i++) {
-          if (typeof self._state.serviceMap[services[i]] === 'undefined')
+          if (typeof self._state.serviceMap[services[i]] === 'undefined' && services[i] !== SNAC_SERVICES.CHAT)
             self._state.serviceMap[services[i]] = conn;
           serVers.push(services[i] >> 8 & 0xFF);
           serVers.push(services[i] & 0xFF);
           serVers.push(SNAC_SERVICE_VERSIONS[services[i]] >> 8 & 0xFF);
           serVers.push(SNAC_SERVICE_VERSIONS[services[i]] & 0xFF);
         }
-        self._send(conn, self._createFLAP(FLAP_CHANNELS.SNAC,
+        self._send(conn, self._createFLAP(conn, FLAP_CHANNELS.SNAC,
           self._createSNAC(SNAC_SERVICES.GENERIC, 0x17, NO_FLAGS,
             serVers
           )
         ), function(e) { process.nextTick(function(){ self._login(e, conn, loginCb, reentry + 1); }); });
       break;
       case 4: // server acked our service versions
-        self._send(conn, self._createFLAP(FLAP_CHANNELS.SNAC,
+        self._send(conn, self._createFLAP(conn, FLAP_CHANNELS.SNAC,
           self._createSNAC(SNAC_SERVICES.GENERIC, 0x06, NO_FLAGS
           )
         ), function(e) { process.nextTick(function(){ self._login(e, conn, loginCb, reentry + 1); }); });
@@ -1972,7 +2628,7 @@ OscarConnection.prototype._login = function(error, conn, loginCb, reentry) {
             groups[i] = (group & 0xFF);
             groups.splice(i, 0, (group >> 8 & 0xFF));
           }
-          self._send(conn, self._createFLAP(FLAP_CHANNELS.SNAC,
+          self._send(conn, self._createFLAP(conn, FLAP_CHANNELS.SNAC,
             self._createSNAC(SNAC_SERVICES.GENERIC, 0x08, NO_FLAGS,
               groups
             )
@@ -1982,7 +2638,7 @@ OscarConnection.prototype._login = function(error, conn, loginCb, reentry) {
         conn.respCount = 0;
         if (!conn.neededServices || typeof conn.neededServices[SNAC_SERVICES.LOCATION] !== 'undefined') {
           conn.respCount++;
-          self._send(self._createFLAP(FLAP_CHANNELS.SNAC,
+          self._send(self._createFLAP(conn, FLAP_CHANNELS.SNAC,
             self._createSNAC(SNAC_SERVICES.LOCATION, 0x02, NO_FLAGS
             )
           ), function(e) { process.nextTick(function(){ self._login(e, conn, loginCb, reentry + 1); }); });
@@ -1990,7 +2646,7 @@ OscarConnection.prototype._login = function(error, conn, loginCb, reentry) {
 
         /*if (!conn.neededServices || typeof conn.neededServices[SNAC_SERVICES.LIST_MGMT] !== 'undefined') {
           conn.respCount++;
-          self._send(self._createFLAP(FLAP_CHANNELS.SNAC,
+          self._send(self._createFLAP(conn, FLAP_CHANNELS.SNAC,
             self._createSNAC(SNAC_SERVICES.LIST_MGMT, 0x02, NO_FLAGS
             )
           ), function(e) { process.nextTick(function(){ self._login(e, conn, loginCb, reentry + 1); }); });
@@ -1998,15 +2654,23 @@ OscarConnection.prototype._login = function(error, conn, loginCb, reentry) {
 
         if (!conn.neededServices || typeof conn.neededServices[SNAC_SERVICES.ICBM] !== 'undefined') {
           conn.respCount++;
-          self._send(self._createFLAP(FLAP_CHANNELS.SNAC,
+          self._send(self._createFLAP(conn, FLAP_CHANNELS.SNAC,
             self._createSNAC(SNAC_SERVICES.ICBM, 0x04, NO_FLAGS
+            )
+          ), function(e) { process.nextTick(function(){ self._login(e, conn, loginCb, reentry + 1); }); });
+        }
+
+        if (self._state.serviceMap[SNAC_SERVICES.CHAT_NAV] === conn) {
+          conn.respCount++;
+          self._send(self._createFLAP(conn, FLAP_CHANNELS.SNAC,
+            self._createSNAC(SNAC_SERVICES.CHAT_NAV, 0x02, NO_FLAGS
             )
           ), function(e) { process.nextTick(function(){ self._login(e, conn, loginCb, reentry + 1); }); });
         }
 
         /*if (!conn.neededServices || typeof conn.neededServices[SNAC_SERVICES.SSI] !== 'undefined') {
           conn.respCount++;
-          self._send(self._createFLAP(FLAP_CHANNELS.SNAC,
+          self._send(self._createFLAP(conn, FLAP_CHANNELS.SNAC,
             self._createSNAC(SNAC_SERVICES.PRIVACY_MGMT, 0x02, NO_FLAGS
             )
           ), function(e) { process.nextTick(function(){ self._login(e, conn, loginCb, reentry + 1); }); });
@@ -2014,7 +2678,7 @@ OscarConnection.prototype._login = function(error, conn, loginCb, reentry) {
 
         if (!conn.neededServices || typeof conn.neededServices[SNAC_SERVICES.SSI] !== 'undefined') {
           conn.respCount++;
-          self._send(self._createFLAP(FLAP_CHANNELS.SNAC,
+          self._send(self._createFLAP(conn, FLAP_CHANNELS.SNAC,
             self._createSNAC(SNAC_SERVICES.SSI, 0x02, NO_FLAGS
             )
           ), function(e) { process.nextTick(function(){ self._login(e, conn, loginCb, reentry + 1); }); });
@@ -2028,25 +2692,27 @@ OscarConnection.prototype._login = function(error, conn, loginCb, reentry) {
           conn.respCount--;
         if (conn.respCount === 0) {
           // set new ICBM settings for all channels (even though we only use channel 1 right now):
-          //   * Flags: 'plain' messages only, typing notifications allowed, and offline messages (0x00000007)
-          //     Note: Digsby sends a crazy value like 0x000003DB, so let's use that for now....
+          //   * Flags note: Digsby sends a crazy value like 0x000003DB ....
           //   * max msg size === 8000 (0x1F40) characters?
           //   * min msg interval === 0 seconds
           if ((!conn.neededServices || typeof conn.neededServices[SNAC_SERVICES.ICBM] !== 'undefined')
                && conn.availServices[SNAC_SERVICES.ICBM]) {
-            var warnRecv = self._state.servicesInfo[SNAC_SERVICES.ICBM].maxReceiverWarn,// \
-                warnSend = self._state.servicesInfo[SNAC_SERVICES.ICBM].maxSenderWarn; // -- use defaults for these
-            self._send(self._createFLAP(FLAP_CHANNELS.SNAC,
+            var warnRecv = self._state.svcInfo[SNAC_SERVICES.ICBM].maxReceiverWarn,// \
+                warnSend = self._state.svcInfo[SNAC_SERVICES.ICBM].maxSenderWarn, // -- use defaults for these
+                flags = ICBM_FLAGS.CHANNEL_MSGS_ALLOWED | ICBM_FLAGS.MISSED_CALLS_ENABLED | ICBM_FLAGS.TYPING_NOTIFICATIONS
+                        | ICBM_FLAGS.EVENTS_ALLOWED | ICBM_FLAGS.SMS_SUPPORTED | ICBM_FLAGS.OFFLINE_MSGS_ALLOWED
+                        | ICBM_FLAGS.USE_HTML_FOR_ICQ;
+            self._send(self._createFLAP(conn, FLAP_CHANNELS.SNAC,
               self._createSNAC(SNAC_SERVICES.ICBM, 0x02, NO_FLAGS,
-                [0x00, 0x00,  0x00, 0x00, 0x03, 0xDB,  0x1F, 0x40,
-                 (warnSend >> 8), (warnSend & 0xFF),  (warnRecv >> 8), (warnRecv & 0xFF),
+                [0x00, 0x00,  (flags >> 24 & 0xFF), (flags >> 16 & 0xFF), (flags >> 8 & 0xFF), (flags & 0xFF),  0x1F, 0x40,
+                 (warnSend >> 8 & 0xFF), (warnSend & 0xFF),  (warnRecv >> 8 & 0xFF), (warnRecv & 0xFF),
                  0x00, 0x00,  0x03, 0xE8]
               )
             ));
           }
           // send privacy settings
           /*if (self._state.serviceMap[SNAC_SERVICES.GENERIC] === conn) {
-            self._send(self._createFLAP(FLAP_CHANNELS.SNAC,
+            self._send(self._createFLAP(conn, FLAP_CHANNELS.SNAC,
               self._createSNAC(SNAC_SERVICES.GENERIC, 0x14, NO_FLAGS,
                 [0x00, 0x00, 0x00, (self._options.privacy.showIdle ? 0x01 : 0x00) | (self._options.privacy.showMemberSince ? 0x02 : 0x00)]
               )
@@ -2055,7 +2721,7 @@ OscarConnection.prototype._login = function(error, conn, loginCb, reentry) {
           // send client capabilities
           if ((!conn.neededServices || typeof conn.neededServices[SNAC_SERVICES.LOCATION] !== 'undefined')
                && conn.availServices[SNAC_SERVICES.LOCATION]) {
-            self._send(self._createFLAP(FLAP_CHANNELS.SNAC,
+            self._send(self._createFLAP(conn, FLAP_CHANNELS.SNAC,
               self._createSNAC(SNAC_SERVICES.LOCATION, 0x04, NO_FLAGS,
                 self._createTLV(0x05, CAPABILITIES.INTEROPERATE.concat(CAPABILITIES.TYPING))
               )
@@ -2064,7 +2730,7 @@ OscarConnection.prototype._login = function(error, conn, loginCb, reentry) {
           // send flags and status
           if (self._state.serviceMap[SNAC_SERVICES.GENERIC] === conn) {
             var status = self._state.status, flags = self._state.flags;
-            self._send(conn, self._createFLAP(FLAP_CHANNELS.SNAC,
+            self._send(conn, self._createFLAP(conn, FLAP_CHANNELS.SNAC,
               self._createSNAC(SNAC_SERVICES.GENERIC, 0x1E, NO_FLAGS,
                 self._createTLV(0x06, [(flags >> 8 & 0xFF), (flags & 0xFF), (status >> 8 & 0xFF), (status & 0xFF)])
               )
@@ -2072,13 +2738,12 @@ OscarConnection.prototype._login = function(error, conn, loginCb, reentry) {
           }
           // request current SSI data
           if (!self.contacts.list && (conn.neededServices === null || typeof conn.neededServices[SNAC_SERVICES.SSI] !== 'undefined')) {
-            self._state.isInitialized = true;
             self.contacts.list = {};
             self.contacts.permit = {};
             self.contacts.deny = {};
             self.contacts.prefs = {};
             self._state.SSI = { activated: false, _temp: [] };
-            self._send(self._createFLAP(FLAP_CHANNELS.SNAC,
+            self._send(self._createFLAP(conn, FLAP_CHANNELS.SNAC,
               self._createSNAC(SNAC_SERVICES.SSI, 0x04, NO_FLAGS
               )
             ), function(e) { process.nextTick(function(){ self._login(e, conn, loginCb, reentry + 1); }); });
@@ -2090,7 +2755,7 @@ OscarConnection.prototype._login = function(error, conn, loginCb, reentry) {
           if (conn.neededServices === null || typeof conn.neededServices[SNAC_SERVICES.SSI] !== 'undefined') {
             // start receiving contact list notifications
             self._state.SSI.activated = true;
-            self._send(conn, self._createFLAP(FLAP_CHANNELS.SNAC,
+            self._send(conn, self._createFLAP(conn, FLAP_CHANNELS.SNAC,
               self._createSNAC(SNAC_SERVICES.SSI, 0x07, NO_FLAGS
               )
             ));
@@ -2107,7 +2772,7 @@ OscarConnection.prototype._login = function(error, conn, loginCb, reentry) {
               SNAC_SERVICE_TOOL_VERSIONS[services[i]] >> 8, SNAC_SERVICE_TOOL_VERSIONS[services[i]] & 0xFF
             ]);
           }
-          self._send(conn, self._createFLAP(FLAP_CHANNELS.SNAC,
+          self._send(conn, self._createFLAP(conn, FLAP_CHANNELS.SNAC,
             self._createSNAC(SNAC_SERVICES.GENERIC, 0x02, NO_FLAGS,
               data
             )
@@ -2126,183 +2791,97 @@ OscarConnection.prototype._login = function(error, conn, loginCb, reentry) {
   }
 };
 
-OscarConnection.prototype._createFLAP = function(channel, value) {
+OscarConnection.prototype._createFLAP = function(conn, channel, value) {
   if (typeof channel !== 'number' || channel > 0x05 || channel < 0x01)
     throw new Error('Invalid channel');
 
-  var valueLen, flap;
   if (typeof value === 'undefined')
-    valueLen = 0;
+    value = [];
   else {
-    if (!Buffer.isBuffer(value)) {
-      if (!Array.isArray(value)) {
-        if (typeof value === 'number')
-          value = splitNum(value);
-        else
-          value = str2bytes(''+value);
-      } else {
-        for (var i=0,len=value.length; i<len; i++) {
-          if (typeof value[i] !== 'number') {
-            if (!isNaN(parseInt(''+value[i])))
-              value[i] = parseInt(''+value[i]);
-            else
-              throw new Error('_createFLAP :: Only numbers can be in an Array value. Found a(n) ' + typeof value[i] + ' at index ' + i + ': ' + sys.inspect(value[i]));
-          }
-          if (value[i] > 0xFF)
-            Array.prototype.splice.apply(value, [i, 1].concat(splitNum(value[i])));
+    if (!Array.isArray(value)) {
+      if (typeof value === 'number')
+        value = splitNum(value);
+      else
+        value = str2bytes(''+value);
+    } else {
+      for (var i=0,len=value.length; i<len; i++) {
+        if (typeof value[i] !== 'number') {
+          if (!isNaN(parseInt(''+value[i])))
+            value[i] = parseInt(''+value[i]);
+          else
+            throw new Error('_createFLAP :: Only numbers can be in an Array value. Found a(n) ' + typeof value[i] + ' at index ' + i + ': ' + sys.inspect(value[i]));
         }
+        if (value[i] > 0xFF)
+          Array.prototype.splice.apply(value, [i, 1].concat(splitNum(value[i])));
       }
     }
-    valueLen = value.length;
-  }
-  flap = new Buffer(6+valueLen);
-
-  // FLAP packet id -- constant
-  flap[0] = 0x2A;
-  // channel
-  flap[1] = channel;
-  // sequence number -- incremented for each command sent, independent of channel
-  this._state.seqNum = (this._state.seqNum === 0x7FFF ? 0 : this._state.seqNum + 1);
-  flap[2] = (this._state.seqNum >> 8);
-  flap[3] = (this._state.seqNum & 0xFF);
-  // value size
-  flap[4] = (valueLen >> 8);
-  flap[5] = (valueLen & 0xFF);
-  // value
-  if (valueLen > 0) {
-    if (Array.isArray(value)) {
-      for (var i=0; i<valueLen; i++)
-        flap[6+i] = value[i];
-    } else
-      value.copy(flap, 6, 0);
   }
 
-  return flap;
+  var seqNum = conn.seqNum = (conn.seqNum === 0x7FFF ? 0 : conn.seqNum + 1);
+  return [0x2A,  channel,  (seqNum >> 8 & 0xFF), (seqNum & 0xFF),  (value.length >> 8 & 0xFF), (value.length & 0xFF)].concat(value);
 };
 
-// Note: SNACs are always sent on channel 0x02
 OscarConnection.prototype._createSNAC = function(serviceID, subtypeID, flags, value) {
-  var validService = false;
-  for (var i=0,keys=Object.keys(SNAC_SERVICES),len=keys.length; i<len; i++) {
-    if (SNAC_SERVICES[keys[i]] === serviceID) {
-      validService = true;
-      break;
-    }
-  }
-  if (!validService)
+  if (!(Object.keys(SNAC_SERVICES).some(function(x){return SNAC_SERVICES[x] === serviceID;})))
     throw new Error('Invalid SNAC service id');
   else if (typeof subtypeID !== 'number' || subtypeID < 1 || subtypeID > 0xFFFF)
     throw new Error('Invalid service subtype id');
   else if (typeof flags !== 'number' || flags > 0xFFFF)
     throw new Error('Invalid flags');
 
-  var valueLen, snac;
   if (typeof value === 'undefined')
-    valueLen = 0;
+    value = [];
   else {
-    if (!Buffer.isBuffer(value)) {
-      if (!Array.isArray(value)) {
-        if (typeof value === 'number')
-          value = splitNum(value);
-        else
-          value = str2bytes(''+value);
-      } else {
-        for (var i=0,len=value.length; i<len; i++) {
-          if (typeof value[i] !== 'number') {
-            if (!isNaN(parseInt(''+value[i])))
-              value[i] = parseInt(''+value[i]);
-            else
-              throw new Error('_createSNAC :: Only numbers can be in an Array value. Found a(n) ' + typeof value[i] + ' at index ' + i + ': ' + sys.inspect(value[i]));
-          }
-          if (value[i] > 0xFF)
-            Array.prototype.splice.apply(value, [i, 1].concat(splitNum(value[i])));
+    if (!Array.isArray(value)) {
+      if (typeof value === 'number')
+        value = splitNum(value);
+      else
+        value = str2bytes(''+value);
+    } else {
+      for (var i=0,len=value.length; i<len; i++) {
+        if (typeof value[i] !== 'number') {
+          if (!isNaN(parseInt(''+value[i])))
+            value[i] = parseInt(''+value[i]);
+          else
+            throw new Error('_createSNAC :: Only numbers can be in an Array value. Found a(n) ' + typeof value[i] + ' at index ' + i + ': ' + sys.inspect(value[i]));
         }
+        if (value[i] > 0xFF)
+          Array.prototype.splice.apply(value, [i, 1].concat(splitNum(value[i])));
       }
     }
-    valueLen = value.length;
   }
-  snac = new Buffer(10+valueLen);
-
-  // SNAC service id
-  snac[0] = (serviceID >> 8);
-  snac[1] = (serviceID & 0xFF);
-  // SNAC subtype id
-  snac[2] = (subtypeID >> 8);
-  snac[3] = (subtypeID & 0xFF);
-  // SNAC flags
-  snac[4] = (flags >> 8);
-  snac[5] = (flags & 0xFF);
-  // SNAC request id
-  this._state.reqID = (this._state.reqID === 0x7FFFFFFF ? 1 : this._state.reqID + 1);
-  snac[6] = (this._state.reqID >> 24);
-  snac[7] = (this._state.reqID >> 16);
-  snac[8] = (this._state.reqID >> 8);
-  snac[9] = (this._state.reqID & 0xFF);
-  // value
-  if (valueLen > 0) {
-    if (Array.isArray(value)) {
-      for (var i=0; i<valueLen; i++)
-        snac[10+i] = value[i];
-    } else
-      value.copy(snac, 10, 0);
-  }
-
-  return snac;
+  var reqID = this._state.reqID = (this._state.reqID === 0x7FFFFFFF ? 1 : this._state.reqID + 1);
+  return [(serviceID >> 8 & 0xFF), (serviceID & 0xFF),  (subtypeID >> 8 & 0xFF), (subtypeID & 0xFF),
+          (flags >> 8 & 0xFF), (flags & 0xFF),  (reqID >> 24 & 0xFF), (reqID >> 16 & 0xFF), (reqID >> 8 & 0xFF), (reqID & 0xFF)].concat(value);
 };
 
-OscarConnection.prototype._createTLV = function(type, value, arrayOnly) {
+OscarConnection.prototype._createTLV = function(type, value) {
   if (typeof type !== 'number' || type < 1 || type > 0xFFFF)
     throw new Error('Invalid type');
 
-  var valueLen, tlv;
   if (typeof value === 'undefined')
-    valueLen = 0;
+    value = [];
   else {
-    if (!Buffer.isBuffer(value)) {
-      if (!Array.isArray(value)) {
-        if (typeof value === 'number')
-          value = splitNum(value);
-        else
-          value = str2bytes(''+value);
-      } else {
-        for (var i=0,len=value.length; i<len; i++) {
-          if (typeof value[i] !== 'number') {
-            if (!isNaN(parseInt(''+value[i])))
-              value[i] = parseInt(''+value[i]);
-            else
-              throw new Error('_createTLV :: Only numbers can be in an Array value. Found a(n) ' + typeof value[i] + ' at index ' + i + ': ' + sys.inspect(value[i]));
-          }
-          if (value[i] > 0xFF)
-            Array.prototype.splice.apply(value, [i, 1].concat(splitNum(value[i])));
+    if (!Array.isArray(value)) {
+      if (typeof value === 'number')
+        value = splitNum(value);
+      else
+        value = str2bytes(''+value);
+    } else {
+      for (var i=0,len=value.length; i<len; i++) {
+        if (typeof value[i] !== 'number') {
+          if (!isNaN(parseInt(''+value[i])))
+            value[i] = parseInt(''+value[i]);
+          else
+            throw new Error('_createTLV :: Only numbers can be in an Array value. Found a(n) ' + typeof value[i] + ' at index ' + i + ': ' + sys.inspect(value[i]));
         }
+        if (value[i] > 0xFF)
+          Array.prototype.splice.apply(value, [i, 1].concat(splitNum(value[i])));
       }
     }
-    valueLen = value.length;
-  }
-  tlv = new Buffer(4+valueLen);
-
-  // TLV type
-  tlv[0] = (type >> 8);
-  tlv[1] = (type & 0xFF);
-  // TLV value length
-  tlv[2] = (valueLen >> 8);
-  tlv[3] = (valueLen & 0xFF);
-  // value
-  if (valueLen > 0) {
-    if (Array.isArray(value)) {
-      for (var i=0; i<valueLen; i++)
-        tlv[4+i] = value[i];
-    } else
-      value.copy(tlv, 4, 0);
   }
 
-  if (arrayOnly) {
-    var a = new Array(tlv.length);
-    for (var i=0,len=a.length; i<len; i++)
-      a[i] = tlv[i];
-    return a;
-  } else
-    return tlv;
+  return [(type >> 8 & 0xFF), (type & 0xFF),  (value.length >> 8 & 0xFF), (value.length & 0xFF)].concat(value);
 };
 
 /**
@@ -2317,7 +2896,7 @@ function extend() {
   var target = arguments[0] || {}, i = 1, length = arguments.length, deep = false, options, name, src, copy;
 
   // Handle a deep copy situation
-  if (typeof target === "boolean") {
+  if (typeof target === 'boolean') {
     deep = target;
     target = arguments[1] || {};
     // skip the boolean and the target
@@ -2325,18 +2904,18 @@ function extend() {
   }
 
   // Handle case when target is a string or something (possible in deep copy)
-  if (typeof target !== "object" && !typeof target === 'function')
+  if (typeof target !== 'object' && !typeof target === 'function')
     target = {};
 
   var isPlainObject = function(obj) {
     // Must be an Object.
     // Because of IE, we also have to check the presence of the constructor property.
     // Make sure that DOM nodes and window objects don't pass through, as well
-    if (!obj || toString.call(obj) !== "[object Object]" || obj.nodeType || obj.setInterval)
+    if (!obj || toString.call(obj) !== '[object Object]' || obj.nodeType || obj.setInterval)
       return false;
     
-    var has_own_constructor = hasOwnProperty.call(obj, "constructor");
-    var has_is_property_of_method = hasOwnProperty.call(obj.constructor.prototype, "isPrototypeOf");
+    var has_own_constructor = hasOwnProperty.call(obj, 'constructor');
+    var has_is_property_of_method = hasOwnProperty.call(obj.constructor.prototype, 'isPrototypeOf');
     // Not own constructor property must be Object
     if (obj.constructor && !has_own_constructor && !has_is_property_of_method)
       return false;
@@ -2348,7 +2927,7 @@ function extend() {
     for (key in obj)
       last_key = key;
     
-    return typeof last_key === "undefined" || hasOwnProperty.call(obj, last_key);
+    return typeof last_key === 'undefined' || hasOwnProperty.call(obj, last_key);
   };
 
 
@@ -2372,7 +2951,7 @@ function extend() {
           target[name] = extend(deep, clone, copy);
 
         // Don't bring in undefined values
-        } else if (typeof copy !== "undefined")
+        } else if (typeof copy !== 'undefined')
           target[name] = copy;
       }
     }
@@ -2388,7 +2967,12 @@ function extractTLVs(buffer, idxStart, tlvTotal) {
     tlvType = (buffer[i++] << 8) + buffer[i++];
     tlvLen = (buffer[i++] << 8) + buffer[i++];
     //debug('extractTLVs(buffer,' + (idxStart || 10) + ',' + tlvTotal + ') :: i == ' + i + ', buffer[i] === 0x' + buffer[i].toString(16) + ', tlvType == 0x' + tlvType.toString(16) + ', tlvLen == ' + tlvLen + ' (0x' + tlvLen.toString(16) + '), dataLen == ' + dataLen);
-    tlvs[tlvType] = (tlvLen > 0 ? buffer.slice(i, i+tlvLen) : undefined);
+    if (tlvs[tlvType]) {
+      if (!Array.isArray(tlvs[tlvType]))
+        tlvs[tlvType] = [tlvs[tlvType]];
+      tlvs[tlvType].push((tlvLen > 0 ? buffer.slice(i, i+tlvLen) : undefined));
+    } else
+      tlvs[tlvType] = (tlvLen > 0 ? buffer.slice(i, i+tlvLen) : undefined);
     i += tlvLen;
     if (tlvTotal && ++added === tlvTotal)
       return [tlvs, i];
@@ -2396,13 +2980,14 @@ function extractTLVs(buffer, idxStart, tlvTotal) {
   return tlvs;
 }
 
-function splitNum(num, max) {
-  var newval = [], shifted=0;
-  max = max || 0;
-  while (num > 0 || (max > 0 && shifted < max)) {
+function splitNum(num, size) {
+  var newval = [];
+  size = size || 0;
+  while (num > 0 || size > 0) {
     newval.unshift(num & 0xFF);
     num >>= 8;
-    shifted++;
+    if (size)
+      size--;
   }
   return newval;
 }
@@ -2422,6 +3007,13 @@ function toHexStr(o) {
   return (Buffer.isBuffer(o) ? o.toArray() : o).reduce(function(p,c) {
     return p.toString(16) + (c.toString(16).length === 1 ? '0' : '') + c.toString(16);
   })
+}
+
+function arraysEqual(a, b) {
+  var equal = false;
+  if (a.length === b.length)
+    equal = a.every(function(value,index) { return value === b[index]; });
+  return equal;
 }
 
 Buffer.prototype.append = function(buf) {
@@ -2545,7 +3137,7 @@ var TLV_TYPES = {
   PASSWORD_NEW: 0x02, // value: string
   CLIENT_ID_STR: 0x03, // value: string
   ERROR_DESC_URL: 0x04, // value: string
-  BOS_SERVER: 0x05, // value: string -- "server:port"
+  BOS_SERVER: 0x05, // value: string -- 'server:port'
   AUTH_COOKIE: 0x06, // value: byte array
   SNAC_VER: 0x07, // value: unknown
   ERROR: 0x08, // value: word
@@ -2559,7 +3151,7 @@ var TLV_TYPES = {
   SCRIPT: 0x10, // value: unknown
   USER_EMAIL: 0x11, // value: string
   PASSWORD_OLD: 0x12, // value: string
-  REG_STATUS: 0x13, // value: word (visibility status -- "let those who know my email address know ..."(?)) (0x01 -- "Nothing about me", 0x02 -- "Only that I have an account", 0x03 -- "My screen name")
+  REG_STATUS: 0x13, // value: word (visibility status -- 'let those who know my email address know ...'(?)) (0x01 -- 'Nothing about me', 0x02 -- 'Only that I have an account', 0x03 -- 'My screen name')
   DISTRIB_NUM: 0x14, // value: dword
   PERSONAL_TEXT: 0x15, // value: unknown
   CLIENT_ID: 0x16, // value: word
@@ -2793,7 +3385,7 @@ var MESSAGE_TYPES = {
   AUTHDENY: 0x07, // Authorization denied message (0xFE formatted)
   AUTHOK: 0x08,   // Authorization given message (empty)
   SERVER: 0x09,   // Message from OSCAR server (0xFE formatted)
-  ADDED: 0x0C,    // "You-were-added" message (0xFE formatted)
+  ADDED: 0x0C,    // 'You-were-added' message (0xFE formatted)
   WWP: 0x0D,      // Web pager message (0xFE formatted)
   EEXPRESS: 0x0E, // Email express message (0xFE formatted)
   CONTACTS: 0x13, // Contact list message
@@ -2815,7 +3407,34 @@ var ICBM_FLAGS = {
   TYPING_NOTIFICATIONS: 0x00000004,
   EVENTS_ALLOWED: 0x00000008,
   SMS_SUPPORTED: 0x00000010,
-  OFFLINE_MSGS_ALLOWED: 0x00000100
+  OFFLINE_MSGS_ALLOWED: 0x00000100,
+  USE_HTML_FOR_ICQ: 0x00000400
+};
+var ICBM_RENDEZVOUS_STATUSES = {
+  REQUEST: 0x0000,
+  CANCEL: 0x0001,
+  ACCEPT: 0x0002
+};
+var ICBM_MISSED_REASONS = {
+  INVALID: 0x0000,
+  TOO_BIG: 0x0001,
+  RATE_EXCEEDED: 0x0002,
+  SENDER_EVIL: 0x0003,
+  SELF_EVIL: 0x0004
+};
+var ICBM_MSG_FLAGS = {
+  AWAY: 0x0001, // auto-reply
+  ACK: 0x0002, // request msg ack
+  REQ_ICON: 0x0010, // icon requested
+  HAS_ICON: 0x0020, // user has an icon
+  SUBENC_MACINTOSH: 0x0040, // ???
+  CUSTOM_FEATURES: 0x0080, // features field present
+  OFFLINE: 0x0800 // offline message
+};
+var ICBM_MSG_CHARSETS = {
+  ASCII: 0x0000, // ISO 646
+  UNICODE: 0x0002, // ISO 10646 (UTF-16/UCS-2BE)
+  LATIN1: 0x0003 // ISO 8859-1
 };
 var ICBM_ERRORS = {
   USER_OFFLINE: 0x04,
@@ -2884,6 +3503,17 @@ var SSI_PREFS = {
   DENY_SOME: 0x04,
   PERMIT_ON_LIST: 0x05
 };
+var CHAT_PERMS = {
+  NONE: 0x00,
+  CREATE_ROOM: 0x01,
+  CREATE_EXCHG: 0x02
+};
+var CHAT_FLAGS = {
+  EVILABLE: 0x01,
+  NAV_ONLY: 0x02,
+  CAN_INSTANCE: 0x03,
+  CAN_PEEK: 0x04
+};
 var TYPING_NOTIFY = {
   FINISH: 0x0000,
   TEXT_ENTERED: 0x0001,
@@ -2891,6 +3521,9 @@ var TYPING_NOTIFY = {
   CLOSED: 0x000F // IM window was closed
 };
 var NO_FLAGS = 0x0000;
+var MAX_SN_LEN = 97;
+var MAX_MSG_LEN = 2544;
+var MAX_ICON_LEN = 7168;
 var SERVER_AOL = 'login.oscar.aol.com';
 var SERVER_ICQ = 'login.icq.com';
 // End Constants -----------------------------------------------------------------------------

@@ -18,9 +18,9 @@ aim.on('typing', function(who, type) {
     type = 'closed the IM';
   console.log('test.js :: typing notification: ' + who + ' ' + type);
 });
-aim.on('im', function(who, text, warnLevel) {
-  console.log('test.js :: received IM from ' + who + '(' + warnLevel + '): ' + text);
-  aim.sendIM(who, 'you said: ' + text); // echo back
+aim.on('im', function(text, sender, warnLevel, flags, when) {
+  console.log('test.js :: received IM from ' + sender.name + '(' + warnLevel + '): ' + text);
+  aim.sendIM(sender.name, 'I got your IM!');
 });
 aim.on('contactonline', function(user) {
   var status = 'other';

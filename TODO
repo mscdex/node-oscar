@@ -4,14 +4,9 @@
 
 - Improve error messages -- check for subcodes, etc.
 
-- Offline message support
+- Offline message support (code is there, but isn't fully tested yet)
 
 - Secure connection support
-
-- Replace HTTP-based method of fetching contact icons with the OSCAR method -- connecting to a secondary server that
-  supports BART (service 0x10). Note: The reason I switched to the HTTP method is because ECONNRESET was occurring on
-  the first (main) connection if any packets were sent on that connection after the auth cookie was sent on the second
-  connection. However, incoming packets are received just fine in this situation on the main connection and do not cause ECONNRESET.
 
 - If requesting a new service and our main connection is SSL, add empty TLV 0x8C to the service request.
   Similarly, if the requested service redirect response (0x05) contains TLV 0x8E, use SSL if val > 0, else no SSL
