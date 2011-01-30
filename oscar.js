@@ -167,7 +167,7 @@ OscarConnection.prototype.setProfile = function(text) {
 };
 
 OscarConnection.prototype.warn = function(who, isAnonymous, cb) {
-  isAnonymous = (typeof isAnonymous === 'undefined' ? true : isAnonymous)
+  isAnonymous = (typeof isAnonymous !== 'boolean' ? true : isAnonymous);
   cb = arguments[arguments.length-1];
   if (self._state.isAOL) {
     var msgLen, self = this;
@@ -219,8 +219,8 @@ OscarConnection.prototype.addContact = function(who, group, cb) {
   cb = (typeof group === 'function' ? group : cb);
 
   for (var i=0,groups=Object.keys(self.contacts.list),len=groups.length; i<len; i++)
-    contactContact += Object.keys(self.contacts.list[groups[i]].contacts).length;
-  if (contactCount < self._state.svcInfo[SNAC_SERVICES.SSI].maxGroups) {
+    contactCount += Object.keys(self.contacts.list[groups[i]].contacts).length;
+  if (contactCount < self._state.svcInfo[SNAC_SERVICES.SSI].maxContacts) {
     record = (typeof who !== 'object' ? { name: '' } : who);
     if (typeof group !== 'function')
       record.group = group;
@@ -609,8 +609,7 @@ OscarConnection.prototype.inviteChat = function(name, msg, who) {
       who = msg;
       msg = 'Please join me in this chat';
     }
-    this._chatInvite(who, msg, this._state.chatrooms[name].roomInfo);
-    return true;
+    return this._chatInvite(who, msg, this._state.chatrooms[name].roomInfo);
   } else
     return false;
 };
@@ -1136,7 +1135,7 @@ OscarConnection.prototype._calcIconSum = function(icon) {
 
 OscarConnection.prototype._sendIcon = function(who) {
   if (Buffer.isBuffer(this.icon.data) || Array.isArray(this.icon.data)) {
-    if (this.icon.data.length < MAX_ICON_LEN) {
+    if (this.icon.data.length <= MAX_ICON_LEN) {
       var content = [], cookie;
       who = str2bytes(who);
       cookie = splitNum(Date.now(), 4).concat(splitNum(Date.now()+1, 4));
@@ -1206,6 +1205,7 @@ OscarConnection.prototype._chatInvite = function(who, msg, roomInfo) {
       content
     )
   ));
+  return cookie.join('');
 };
 
 OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
@@ -1551,9 +1551,18 @@ OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
       switch (subtypeID) {
         case 0x01: // error
           debugtext += 'Error';
-          var code = (snac[idx++] << 8) + snac[idx++], msg = ICBM_ERRORS_TEXT[code] || 'Unknown error code received: ' + code,
-              err = new Error(msg);
+          var code = (snac[idx++] << 8) + snac[idx++], subcode, err,
+              msg = ICBM_ERRORS_TEXT[code] || 'Unknown error code received: ' + code;
+          tlvs = extractTLVs(snac, idx);
+          if (tlvs[0x08]) {
+            subcode = (tlvs[0x08][0] << 8) + tlvs[0x08][1];
+            msg += ICBM_SUBCODE_ERRORS_TEXT[subcode] || 'Unknown sub error code';
+          } else
+            msg += 'Unknown error';
+          msg += ' (code: ' + code + ', subcode: ' + subcode + ')';
+          err = new Error(msg);
           err.code = code;
+          err.subcode = subcode;
           debugtext += ': ' + msg;
           self._dispatch(reqID, err);
         break;
@@ -1673,22 +1682,22 @@ OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
                     var fileInfo = self._incomingFile(info, tlvs[0x2711]);
                     //debug('Incoming file transfer request ... Sender: ' + sys.inspect(sender) + ' File info: ' + sys.inspect(fileInfo));
                     debugtext += ': File xfer request. Sender: ' + sys.inspect(sender.name) + ' File info: ' + sys.inspect(fileInfo);
-                    self.emit('filexfer', sender.name, fileInfo);
+                    self.emit('filexfer', sender, fileInfo);
                   } else if (arraysEqual(type, CAPABILITIES.BUDDY_ICON)) {
                     var iconInfo = self._incomingIcon(info, tlvs[0x2711]);
                     //debug('Incoming icon data ... Sender: ' + sys.inspect(sender) + ' Icon info: ' + sys.inspect(iconInfo));
                     debugtext += ': Icon data. Sender: ' + sys.inspect(sender.name) + ' Icon info: ' + sys.inspect(iconInfo);
-                    self.emit('icon', sender.name, iconInfo.data);
+                    self.emit('icon', sender, iconInfo.data);
                   } else if (arraysEqual(type, CAPABILITIES.CHAT)) {
                     var roomInfo = self._incomingChat(info, tlvs[0x2711]);
                     //debug('Incoming chat invitation ... Sender: ' + sys.inspect(sender) + ' Chat room info: ' + sys.inspect(roomInfo));
                     debugtext += ': Chat invitation. Sender: ' + sys.inspect(sender.name) + ' Chat room info: ' + sys.inspect(roomInfo);
-                    self.emit('chatrequest', sender.name, roomInfo);
+                    self.emit('chatinvite', sender, roomInfo.name, info.msg);
                   } else if (arraysEqual(type, CAPABILITIES.SEND_CONTACT_LIST)) {
                     var list = self._incomingList(info, tlvs[0x2711]);
                     //debug('Incoming contact list ... Sender: ' + sys.inspect(sender) + ' List: ' + sys.inspect(list));
                     debugtext += ': Contact list. Sender: ' + sys.inspect(sender.name) + ' List: ' + sys.inspect(list);
-                    self.emit('contactlist', sender.name, list);
+                    self.emit('contactlist', sender, list);
                   }
                 }
               }
@@ -1787,18 +1796,18 @@ OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
       switch (subtypeID) {
         case 0x01:
           debugtext += ' Error';
-          var code = (snac[idx++] << 8) + snac[idx++], code2,
+          var code = (snac[idx++] << 8) + snac[idx++], subcode,
               msg = 'Could not join chat room: ', err;
           tlvs = extractTLVs(snac, idx);
           if (tlvs[0x08]) {
-            code2 = (tlvs[0x08][0] << 8) + tlvs[0x08][1];
+            subcode = (tlvs[0x08][0] << 8) + tlvs[0x08][1];
             msg += 'Invalid chat room name';
           } else
             msg += 'Unknown error';
-          msg += ' (code: ' + code + ', code2: ' + code2 + ')';
+          msg += ' (code: ' + code + ', subcode: ' + subcode + ')';
           err = new Error(msg);
           err.code = code;
-          err.code2 = code2;
+          err.subcode = subcode;
           debugtext += ': ' + msg;
           self._dispatch(reqID, err);
         break;
@@ -2002,6 +2011,7 @@ OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
           len = (snac[idx++] << 8) + snac[idx++];
           icon = snac.slice(idx, idx+len);
           debugtext += who;
+          self._dispatch(reqID, undefined, icon, (type === 0x0000 ? 'small' : 'normal'));
           self.emit('icon', who, icon, (type === 0x0000 ? 'small' : 'normal'));
         break;
         default:
@@ -2251,6 +2261,7 @@ OscarConnection.prototype._parseUserInfo = function(data, idx, skipExtra) {
     onlineSince: undefined,
     idleMins: undefined, // the client actually tells AOL when to start and stop counting idle time, so this value could be unreliable
     flags: undefined,
+    status: undefined,
     IP: undefined,
     capabilities: undefined,
     instanceNum: undefined,
@@ -3298,8 +3309,8 @@ var AUTH_ERRORS_TEXT = {};
 AUTH_ERRORS_TEXT[AUTH_ERRORS.LOGIN_INVALID1] = 'Invalid nick or password';
 AUTH_ERRORS_TEXT[AUTH_ERRORS.SERVICE_DOWN1] = 'Service temporarily unavailable';
 AUTH_ERRORS_TEXT[AUTH_ERRORS.OTHER] = 'All other errors';
-AUTH_ERRORS_TEXT[AUTH_ERRORS.LOGIN_INVALID2] = 'Incorrect nick or password, re-enter';
-AUTH_ERRORS_TEXT[AUTH_ERRORS.LOGIN_INVALID3] = 'Mismatch nick or password, re-enter';
+AUTH_ERRORS_TEXT[AUTH_ERRORS.LOGIN_INVALID2] = 'Incorrect nick or password';
+AUTH_ERRORS_TEXT[AUTH_ERRORS.LOGIN_INVALID3] = 'Mismatch nick or password';
 AUTH_ERRORS_TEXT[AUTH_ERRORS.BAD_INPUT] = 'Internal client error (bad input to authorizer)';
 AUTH_ERRORS_TEXT[AUTH_ERRORS.ACCOUNT_INVALID] = 'Invalid account';
 AUTH_ERRORS_TEXT[AUTH_ERRORS.ACCOUNT_DELETED] = 'Deleted account';
@@ -3316,8 +3327,8 @@ AUTH_ERRORS_TEXT[AUTH_ERRORS.DB_SEND] = 'DB send error';
 AUTH_ERRORS_TEXT[AUTH_ERRORS.DB_LINK] = 'DB link error';
 AUTH_ERRORS_TEXT[AUTH_ERRORS.RESERVATION_MAP] = 'Reservation map error';
 AUTH_ERRORS_TEXT[AUTH_ERRORS.RESERVATION_LINK] = 'Reservation link error';
-AUTH_ERRORS_TEXT[AUTH_ERRORS.MAX_IP_CONN] = 'The users num connected from this IP has reached the maximum';
-AUTH_ERRORS_TEXT[AUTH_ERRORS.MAX_IP_CONN_RESERVATION] = 'The users num connected from this IP has reached the maximum (reservation)';
+AUTH_ERRORS_TEXT[AUTH_ERRORS.MAX_IP_CONN] = 'The number of users connected from this IP has reached the maximum';
+AUTH_ERRORS_TEXT[AUTH_ERRORS.MAX_IP_CONN_RESERVATION] = 'The number of users connected from this IP has reached the maximum (reservation)';
 AUTH_ERRORS_TEXT[AUTH_ERRORS.RATE_RESERVATION] = 'Rate limit exceeded (reservation). Please try to reconnect in a few minutes';
 AUTH_ERRORS_TEXT[AUTH_ERRORS.HEAVILY_WARNED] = 'User too heavily warned';
 AUTH_ERRORS_TEXT[AUTH_ERRORS.TIMEOUT_RESERVATION] = 'Reservation timeout';
@@ -3351,7 +3362,7 @@ var DC_PROTOCOLS = { // ICQ only
 };
 var USER_CLASSES = {
   UNCONFIRMED: 0x0001,   // AOL unconfirmed user flag
-  ADMINISTRATOR: 0x0002, // AOL administrator flag
+  ADMIN: 0x0002,         // AOL administrator flag
   STAFF: 0x0004,         // AOL staff user flag
   COMMERCIAL: 0x0008,    // AOL commercial account flag
   FREE: 0x0010,          // AOL non-commercial account flag
@@ -3454,11 +3465,40 @@ var ICBM_ERRORS = {
   MSG_INVALID: 0x0E,
   BLOCKED: 0x10
 };
+var ICBM_SUBCODE_ERRORS = {
+  REMOTE_IM_OFF: 0x01,
+  REMOTE_RESTRICTED_BY_PC: 0x02,
+  SMS_NEED_LEGAL: 0x03,
+  SMS_NO_DISCLAIMER: 0x04,
+  SMS_COUNTRY_UNALLOWED: 0x05,
+  SMS_UNKNOWN_COUNTRY: 0x08,
+  CANNOT_INIT_IM: 0x09,
+  IM_UNALLOWED: 0x0A,
+  USAGE_LIMIT: 0x0B,
+  DAILY_USAGE_LIMIT: 0x0C,
+  MONTHLY_USAGE_LIMIT: 0x0D,
+  OFFLINE_IM_UNACCEPTED: 0x0E,
+  OFFLINE_IM_EXCEED_MAX: 0x0F
+};
 var ICBM_ERRORS_TEXT = {};
 ICBM_ERRORS_TEXT[ICBM_ERRORS.USER_OFFLINE] = 'You are trying to send a message to an offline user';
 ICBM_ERRORS_TEXT[ICBM_ERRORS.USER_UNSUPPORTED_MSG] = 'This type of message is not supported by that user';
 ICBM_ERRORS_TEXT[ICBM_ERRORS.MSG_INVALID] = 'Message is invalid (incorrect format)';
 ICBM_ERRORS_TEXT[ICBM_ERRORS.BLOCKED] = 'Receiver/Sender is blocked';
+var ICBM_SUBCODE_ERRORS_TEXT = {};
+ICBM_SUBCODE_ERRORS_TEXT[ICBM_SUBCODE_ERRORS.REMOTE_IM_OFF] = 'User is not accepting incoming IMs';
+ICBM_SUBCODE_ERRORS_TEXT[ICBM_SUBCODE_ERRORS.REMOTE_RESTRICTED_BY_PC] = 'The user denied the IM because of parental controls';
+ICBM_SUBCODE_ERRORS_TEXT[ICBM_SUBCODE_ERRORS.SMS_NEED_LEGAL] = 'User tried to send a message to an SMS user and is required to accept the legal text first';
+ICBM_SUBCODE_ERRORS_TEXT[ICBM_SUBCODE_ERRORS.SMS_NO_DISCLAIMER] = 'Client tried to send a message to an SMS user without the character counter being displayed';
+ICBM_SUBCODE_ERRORS_TEXT[ICBM_SUBCODE_ERRORS.SMS_COUNTRY_UNALLOWED] = 'Client tried to send a message to an SMS user but the SMS matrix said the country code combination not permitted';
+ICBM_SUBCODE_ERRORS_TEXT[ICBM_SUBCODE_ERRORS.SMS_UNKNOWN_COUNTRY] = 'Client tried to send to an SMS user but the server could not determine the country';
+ICBM_SUBCODE_ERRORS_TEXT[ICBM_SUBCODE_ERRORS.CANNOT_INIT_IM] = 'An IM cannot be initiated by a bot';
+ICBM_SUBCODE_ERRORS_TEXT[ICBM_SUBCODE_ERRORS.IM_UNALLOWED] = 'An IM is not allowed by a consumer bot to a user';
+ICBM_SUBCODE_ERRORS_TEXT[ICBM_SUBCODE_ERRORS.USAGE_LIMIT] = 'An IM is not allowed by a consumer bot due to reaching a generic usage limit (not common)';
+ICBM_SUBCODE_ERRORS_TEXT[ICBM_SUBCODE_ERRORS.DAILY_USAGE_LIMIT] = 'An IM is not allowed by a consumer bot due to reaching the daily usage limit';
+ICBM_SUBCODE_ERRORS_TEXT[ICBM_SUBCODE_ERRORS.MONTHLY_USAGE_LIMIT] = 'An IM is not allowed by consumer bot due to reaching the monthly usage limit';
+ICBM_SUBCODE_ERRORS_TEXT[ICBM_SUBCODE_ERRORS.OFFLINE_IM_UNACCEPTED] = 'User does not accept offline IMs';
+ICBM_SUBCODE_ERRORS_TEXT[ICBM_SUBCODE_ERRORS.OFFLINE_IM_EXCEED_MAX] = 'User exceeded max offline IM storage limit';
 var CAPABILITIES = {
   INTEROPERATE: [0x09, 0x46, 0x13, 0x4D, 0x4C, 0x7F, 0x11, 0xD1,   // AIM<->ICQ support
                  0x82, 0x22, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00],
@@ -3545,15 +3585,17 @@ exports.OscarConnection = OscarConnection;
 exports.SERVER_AOL = SERVER_AOL;
 exports.SERVER_ICQ = SERVER_ICQ;
 
-exports.GLOBAL_ERRORS = GLOBAL_ERRORS;
+exports.GENERAL_ERRORS = GLOBAL_ERRORS;
 exports.RATE_UPDATES = RATE_UPDATES;
 exports.MSG_ERRORS = ICBM_ERRORS;
+exports.MSG_SUBERRORS = ICBM_SUBCODE_ERRORS;
 exports.AUTH_ERRORS = AUTH_ERRORS;
+
 exports.USER_FLAGS = USER_FLAGS;
 exports.USER_STATUSES = USER_STATUSES;
 exports.USER_CLASSES = USER_CLASSES;
-exports.CAPABILITIES = CAPABILITIES;
 exports.SSI_RESULTS = SSI_ACK_RESULTS;
+exports.CAPABILITIES = CAPABILITIES;
 exports.TYPING_NOTIFY = TYPING_NOTIFY;
 exports.MOTD_TYPES = MOTD_TYPES;
 exports.IM_FLAGS = ICBM_MSG_FLAGS;
