@@ -8,7 +8,7 @@ Requirements
 ============
 
 * [node.js](http://nodejs.org/) -- tested with v0.2.6
-* An AIM or ICQ account -- tested/compatible with AIM so far
+* An AIM account -- ICQ seems to require the clientLogin method for authentication which requires an API key and AOL isn't giving those out to anyone who is not excited about becoming a commercial partner of theirs.
 
 
 Example
@@ -168,7 +168,7 @@ OscarConnection Functions
 Constants
 ---------
 
-The following are available as static constants attached to the OscarConnection class:
+The following are available as static constants attached to the module (example: require('./oscar').IM\_FLAGS.AWAY):
 
 * **IM\_MISSED\_REASONS**
     * **INVALID** - IM data was invalid.
