@@ -8,7 +8,7 @@ Requirements
 ============
 
 * [node.js](http://nodejs.org/) -- tested with v0.2.6
-* An AIM account -- ICQ seems to require the clientLogin method for authentication which requires an API key and AOL isn't giving those out to anyone who is not excited about becoming a commercial partner of theirs.
+* An AIM or ICQ account -- Note: Only ICQ UINs will work and they must be a String when supplied as the username. For new ICQ accounts, they do not give you your ICQ UIN right away (you log in by email address). For these new accounts, you can find your UIN by: logging with the ICQ web client and editing your profile OR by going here (https://www.icq.com/karma/login_page.php), clicking the "Enable Log In With an Email" link, and logging in (your UIN will be displayed on the next page).
 
 
 Example
@@ -118,7 +118,7 @@ OscarConnection Functions
     * **connection** - An Object containing connection settings
       * **username** - A String representing the username for authentication.
       * **password** - A String representing the password for authentication.
-      * **host** - A String representing the hostname or IP address of the OSCAR server. **Default:** AIM's server
+      * **host** - A String representing the hostname or IP address of the OSCAR server. **Default:** SERVER_AOL (predefined constants available, see constants list)
       * **port** - An Integer representing the port of the OSCAR server. **Default:** 5190
       * **connTimeout** - An Integer indicating the number of milliseconds to wait for a connection to be established. **Default:** 10000
       * **allowMultiLogin** - A Boolean indicating whether simultaneous sessions should be allowed. **Default:** true
@@ -169,6 +169,10 @@ Constants
 ---------
 
 The following are available as static constants attached to the module (example: require('./oscar').IM\_FLAGS.AWAY):
+
+* **SERVER\_AOL** - A String containing the host name for logging onto AIM.
+
+* **SERVER\_ICQ** - A String containing the host name for logging onto ICQ.
 
 * **IM\_MISSED\_REASONS**
     * **INVALID** - IM data was invalid.

@@ -1281,8 +1281,9 @@ OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
         break;
         case 0x05: // redirect info for requested service
           debugtext += 'Service request info';
-          var services = flip(SNAC_SERVICES);
+          var services = flip(SNAC_SERVICES), useSSL;
           tlvs = extractTLVs(snac, idx);
+          useSSL = (tlvs[0x8E] && tlvs[0x8E][0] === 0x01);
           if (typeof services[(tlvs[0x0D][0] << 8) + tlvs[0x0D][1]] !== 'undefined')
             debugtext += ' (' + services[(tlvs[0x0D][0] << 8) + tlvs[0x0D][1]] + ')';
           else
@@ -2536,51 +2537,45 @@ OscarConnection.prototype._login = function(error, conn, loginCb, reentry) {
   }
   if (typeof reentry === 'undefined') {
     reentry = -1;
-    if (self._state.isAOL) {
-      // request salt from server for md5 hashing for password
-      self._send(conn, self._createFLAP(conn, FLAP_CHANNELS.SNAC,
-        self._createSNAC(SNAC_SERVICES.AUTH, 0x06, NO_FLAGS,
-          self._createTLV(TLV_TYPES.SCREEN_NAME, self._options.connection.username)
-        )
-      ), function(e, salt) { process.nextTick(function(){ self._login(e, conn, loginCb, reentry + 1, salt); }); });
-    } else {
-      // TODO: truncate password if necessary
-      var roastKey = [0xF3, 0x26, 0x81, 0xC4, 0x39, 0x86, 0xDB, 0x92, 0x71, 0xA3, 0xB9, 0xE6, 0x53, 0x7A, 0x95, 0x7C],
-          roastKeyLen = roastKey.length, roasted = [];
-      for (var i=0,len=self._options.connection.password.length; i<len; i++)
-        roasted.push(self._options.connection.password.charCodeAt(i) ^ roastKey[i%roastKeyLen]);
-      self._send(conn, self._createFLAP(conn, FLAP_CHANNELS.CONN_NEW,
-                self._createTLV(TLV_TYPES.SCREEN_NAME, self._options.connection.username)
-        .concat(self._createTLV(TLV_TYPES.CLIENT_ID_STR, 'ICQ Inc. - Product of ICQ (TM).2003a.5.45.1.3777.85'))
-        .concat(self._createTLV(TLV_TYPES.PASSWORD_NEW, roasted))
-        .concat(self._createTLV(TLV_TYPES.CLIENT_ID, [0x01, 0x0A]))
-        .concat(self._createTLV(TLV_TYPES.CLIENT_VER_MAJOR, [0x00, 0x05]))
-        .concat(self._createTLV(TLV_TYPES.CLIENT_VER_MINOR, [0x00, 0x2D]))
-        .concat(self._createTLV(TLV_TYPES.CLIENT_VER_LESSER, [0x00, 0x00]))
-        .concat(self._createTLV(TLV_TYPES.CLIENT_VER_BUILD, [0x0E, 0xC1]))
-        .concat(self._createTLV(TLV_TYPES.DISTRIB_NUM, [0x00, 0x00, 0x00, 0x55]))
-        .concat(self._createTLV(TLV_TYPES.CLIENT_LANG, 'en'))
-        .concat(self._createTLV(TLV_TYPES.CLIENT_COUNTRY, 'us'))
-      ), function(e, server, cookie) { process.nextTick(function(){ self._login(e, conn, loginCb, 1, server, cookie); }); });
-    }
+    // request salt from server for md5 hashing for password
+    self._send(conn, self._createFLAP(conn, FLAP_CHANNELS.SNAC,
+      self._createSNAC(SNAC_SERVICES.AUTH, 0x06, NO_FLAGS,
+        self._createTLV(TLV_TYPES.SCREEN_NAME, self._options.connection.username)
+      )
+    ), function(e, salt) { process.nextTick(function(){ self._login(e, conn, loginCb, reentry + 1, salt); }); });
   } else {
     switch (reentry) {
       case 0: // server sent us the salt ('key') for our md5 password hashing
         // TODO: truncate password if necessary
-        var salt = arguments[4], hash = [], oldhash;
+        var salt = arguments[4], hash = [], oldhash, clientInfo = {};
+        if (self._state.isAOL) {
+          clientInfo.str = 'AOL Instant Messenger, version 5.9.3702/WIN32';
+          clientInfo.id = [0x01, 0x09];
+          clientInfo.vMajor = [0x00, 0x05];
+          clientInfo.vMinor = [0x00, 0x09];
+          clientInfo.vLesser = [0x00, 0x00];
+          clientInfo.vBuild = [0x0E, 0x76];
+        } else {
+          clientInfo.str = 'ICQ Inc. - Product of ICQ (TM).2003a.5.45.1.3777.85';
+          clientInfo.id = [0x01, 0x0A];
+          clientInfo.vMajor = [0x00, 0x14];
+          clientInfo.vMinor = [0x00, 0x34];
+          clientInfo.vLesser = [0x00, 0x00];
+          clientInfo.vBuild = [0x0C, 0x18];
+        }
         oldhash = crypto.createHash('md5').update(salt).update(self._options.connection.password).update('AOL Instant Messenger (SM)').digest();
         for (var i=0,len=oldhash.length; i<len; i++)
           hash[i] = oldhash.charCodeAt(i);
         self._send(conn, self._createFLAP(conn, FLAP_CHANNELS.SNAC,
           self._createSNAC(SNAC_SERVICES.AUTH, 0x02, NO_FLAGS,
                     self._createTLV(TLV_TYPES.SCREEN_NAME, self._options.connection.username)
-            .concat(self._createTLV(TLV_TYPES.CLIENT_ID_STR, 'AOL Instant Messenger, version 5.9.3702/WIN32'))
+            .concat(self._createTLV(TLV_TYPES.CLIENT_ID_STR, clientInfo.str))
             .concat(self._createTLV(TLV_TYPES.PASSWORD_HASH, hash))
-            .concat(self._createTLV(TLV_TYPES.CLIENT_ID, [0x01, 0x09]))
-            .concat(self._createTLV(TLV_TYPES.CLIENT_VER_MAJOR, [0x00, 0x05]))
-            .concat(self._createTLV(TLV_TYPES.CLIENT_VER_MINOR, [0x00, 0x09]))
-            .concat(self._createTLV(TLV_TYPES.CLIENT_VER_LESSER, [0x00, 0x00]))
-            .concat(self._createTLV(TLV_TYPES.CLIENT_VER_BUILD, [0x0E, 0x76]))
+            .concat(self._createTLV(TLV_TYPES.CLIENT_ID, clientInfo.id))
+            .concat(self._createTLV(TLV_TYPES.CLIENT_VER_MAJOR, clientInfo.vMajor))
+            .concat(self._createTLV(TLV_TYPES.CLIENT_VER_MINOR, clientInfo.vMinor))
+            .concat(self._createTLV(TLV_TYPES.CLIENT_VER_LESSER, clientInfo.vLesser))
+            .concat(self._createTLV(TLV_TYPES.CLIENT_VER_BUILD, clientInfo.vBuild))
             .concat(self._createTLV(TLV_TYPES.DISTRIB_NUM, [0x00, 0x00, 0x01, 0x11]))
             .concat(self._createTLV(TLV_TYPES.CLIENT_LANG, 'en'))
             .concat(self._createTLV(TLV_TYPES.CLIENT_COUNTRY, 'us'))
