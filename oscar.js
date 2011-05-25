@@ -501,6 +501,7 @@ OscarConnection.prototype.renameGroup = function(group, newName, cb) {
 };
 
 OscarConnection.prototype.getInfo = function(who, cb) {
+  var self = this;
   // requests profile, away msg, capabilities
   this._send(this._createFLAP(self._state.connections.main, FLAP_CHANNELS.SNAC,
     this._createSNAC(SNAC_SERVICES.LOCATION, 0x15, NO_FLAGS,
