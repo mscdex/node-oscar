@@ -1,6 +1,13 @@
-var net = require('net'), sys = require('sys'), EventEmitter = require('events').EventEmitter, crypto = require('crypto'), http = require('http');
+var net = require('net'), util = require('util'),
+    EventEmitter = require('events').EventEmitter, crypto = require('crypto');
 var fnEmpty = function() {};
-var debug = fnEmpty/*console.error, hexy = require('./hexy').hexy*/, hexyFormat = { caps: 'upper', format: 'twos', numbering: 'none', groupSpacing: 2 };
+var debug = fnEmpty, hexy, inspectMutated = false,
+    hexyFormat = {
+      caps: 'upper',
+      format: 'twos',
+      numbering: 'none',
+      groupSpacing: 2
+    };
 
 function OscarConnection(options) {
   if (!(this instanceof OscarConnection))
@@ -14,14 +21,24 @@ function OscarConnection(options) {
       host: SERVER_AOL,
       port: 5190,
       connTimeout: 10000, // connection timeout in msecs
-      allowMultiLogin: true
+      allowMultiLogin: true,
+      debug: false
     }, other: {
       initialStatus: USER_STATUSES.ONLINE,
       initialFlags: USER_FLAGS.DCDISABLED
     }
   };
   this._options = extend(true, this._options, options);
-
+  if (typeof this._options.connection.debug === 'function') {
+    debug = this._options.connection.debug;
+    if (!inspectMutated) {
+      inspectMutated = true;
+      hexy = require('./hexy').hexy;
+      Buffer.prototype.inspect = function () {
+        return hexy(this, hexyFormat);
+      };
+    }
+  }
   this._state = {
     connections: {},
     serviceMap: {},
@@ -36,15 +53,16 @@ function OscarConnection(options) {
     svcPaused: {},
     SSI: {},
     iconQueue: {},
-    rndvCookies: {},
-    chatrooms: {}
+    rndvCookies: { out: {}, in: {} },
+    chatrooms: {},
+    p2p: {}
   };
 
   this.icon = { datetime: undefined, data: undefined }; // my 'buddy' icon
   this.me = undefined;
   this.contacts = { lastModified: undefined, list: undefined, permit: undefined, deny: undefined, prefs: undefined, _totalSSICount: 0, _usedIDs: {} };
 }
-sys.inherits(OscarConnection, EventEmitter);
+util.inherits(OscarConnection, EventEmitter);
 
 // setIdle only needs to be called once when you are idle and again when you are no longer idle.
 // The server will automatically increment the idle time for you, so don't call setIdle every second
@@ -63,8 +81,6 @@ OscarConnection.prototype.setIdle = function(amount) { // amount is in seconds i
   ));
 };
 
-// 32-bit little endian conversion
-//((x & 0xFF) << 24) + ((x >> 8 & 0xFF) << 16) + ((x >> 16 & 0xFF) << 8) + (x >> 24 & 0xFF)
 OscarConnection.prototype.sendIM = function(who, message, flags, cb) {
   var msgData, cookie, msgLen, self = this, features = (self._state.isAOL ? [0x01, 0x01, 0x01, 0x02] : [0x01]),
       featLen = features.length, charset = ICBM_MSG_CHARSETS.ASCII, isSMS;
@@ -502,7 +518,7 @@ OscarConnection.prototype.renameGroup = function(group, newName, cb) {
 
 OscarConnection.prototype.getInfo = function(who, cb) {
   // requests profile, away msg, capabilities
-  this._send(this._createFLAP(self._state.connections.main, FLAP_CHANNELS.SNAC,
+  this._send(this._createFLAP(this._state.connections.main, FLAP_CHANNELS.SNAC,
     this._createSNAC(SNAC_SERVICES.LOCATION, 0x15, NO_FLAGS,
       [0x00, 0x00, 0x00, 0x07,  who.length]
       .concat(str2bytes(who))
@@ -669,6 +685,13 @@ OscarConnection.prototype.connect = function(cb) {
   });
 };
 
+OscarConnection.prototype.end = function() {
+  var ids = Object.keys(this._state.connections);
+  for (var i=0,len=ids.length; i<len; ++i)
+    this._state.connections[ids[i]].end();
+  this._resetState();
+};
+
 // Connection handlers -------------------------------------------------------------------------------
 
 function connect_handler(oscar) {
@@ -691,7 +714,7 @@ function connect_handler(oscar) {
 
 function data_handler(oscar, data, cb) {
   var self = oscar, conn = this;
-  //debug('(' + conn.remoteAddress + ') RECEIVED: \n' + sys.inspect(data)) + '\n';
+  //debug('(' + conn.remoteAddress + ') RECEIVED: \n' + util.inspect(data)) + '\n';
   if (conn.curData)
     conn.curData = conn.curData.append(data);
   else
@@ -764,6 +787,7 @@ function end_handler(oscar) {
   var self = oscar, conn = this;
   conn.isConnected = false;
   if (!conn.isTransferring) {
+    self._resetState();
     debug('(' + conn.remoteAddress + ') FIN packet received. Disconnecting...');
     self.emit('end');
   }
@@ -784,12 +808,34 @@ function close_handler(oscar, had_error) {
   var self = oscar, conn = this;
   conn.isConnected = false;
   if (!conn.isTransferring || had_error) {
+    self._resetState();
     debug('(' + conn.remoteAddress + ') Connection forcefully closed.');
     self.emit('close', had_error);
   }
 }
 
 // Private methods -----------------------------------------------------------------------------------
+
+OscarConnection.prototype._resetState = function() {
+  this._state = {
+    connections: {},
+    serviceMap: {},
+    reqID: 0, // 32-bit number that identifies a single SNAC request
+    status: this._options.other.initialStatus,
+    flags: this._options.other.initialFlags,
+    requests: {},
+    isAOL: (this._options.connection.host.substr(this._options.connection.host.length-7).toUpperCase() === 'AOL.COM'),
+    rateLimitGroups: {},
+    rateLimits: {},
+    svcInfo: {},
+    svcPaused: {},
+    SSI: {},
+    iconQueue: {},
+    rndvCookies: { out: {}, in: {} },
+    chatrooms: {},
+    p2p: {}
+  };
+};
 
 OscarConnection.prototype._addConnection = function(id, services, host, port, cb) {
   var self = this;
@@ -1065,7 +1111,7 @@ OscarConnection.prototype._send = function(conn, payload, cb) {
     }
   }
   payload = new Buffer(payload);
-  debug('(' + conn.remoteAddress + ') SENDING: \n' + sys.inspect(payload) + '\n');
+  debug('(' + conn.remoteAddress + ') SENDING: \n' + util.inspect(payload) + '\n');
   conn.write(payload);
 };
 
@@ -1077,7 +1123,7 @@ OscarConnection.prototype._dispatch = function(reqID) {
   }
 };
 
-OscarConnection.prototype._incomingFile = function(info, data) {
+OscarConnection.prototype._incomingFile = function(data) {
   var fileInfo = {}, i = 0, len;
   fileInfo.subtype = (data[i++] << 8) + data[i++]; // 0x0001 === 'one file', 0x0002 === 'more than one file'
   fileInfo.numFiles = (data[i++] << 8) + data[i++];
@@ -1086,14 +1132,14 @@ OscarConnection.prototype._incomingFile = function(info, data) {
   return fileInfo;
 };
 
-OscarConnection.prototype._incomingIcon = function(info, data) {
+OscarConnection.prototype._incomingIcon = function(data) {
   var i = 0, hash = (data[i++] << 24) + (data[i++] << 16) + (data[i++] << 8) + data[i++],
       len = (data[i++] << 24) + (data[i++] << 16) + (data[i++] << 8) + data[i++],
       datetime = (data[i++] << 24) + (data[i++] << 16) + (data[i++] << 8) + data[i++];
   return { hash: hash, datetime: datetime, data: data.slice(i, i+len) };
 };
 
-OscarConnection.prototype._incomingChat = function(info, data) {
+OscarConnection.prototype._incomingChat = function(data) {
   var roomInfo = {}, i = 0, len;
   roomInfo.exchange = (data[i++] << 8) + data[i++];
   len = data[i++];
@@ -1103,7 +1149,7 @@ OscarConnection.prototype._incomingChat = function(info, data) {
   return roomInfo;
 };
 
-OscarConnection.prototype._incomingList = function(info, data) {
+OscarConnection.prototype._incomingList = function(data) {
   var list = {};
   for (var i=0,len=data.length,group,namelen,numContacts; i<len;) {
     namelen = (data[i++] << 8) + data[i++];
@@ -1161,21 +1207,34 @@ OscarConnection.prototype._sendIcon = function(who) {
   }
 };
 
-OscarConnection.prototype._cancelRendezvous = function(cookie, cb) {
+OscarConnection.prototype.sendFile = function(who, file, ip, port, cb) {
+  
+};
+
+OscarConnection.prototype._cancelRendezvous = function(inout, cookie, cb) {
   cookie = ''+cookie;
-  var info = rndvCookies[cookie];
+  var info = rndvCookies[inout][cookie];
   if (typeof info !== 'undefined') {
     var content, type;
     cookie = info.cookie;
     if (info.type === 'chat')
       type = CAPABILITIES.CHAT;
-    content = cookie.concat[0x00, 0x02, who.length].concat(who).concat(this._createTLV(0x03))
-                    .concat(this._createTLV(0x05, [0x00, 0x01].concat(cookie).concat(type).concat(this._createTLV(0x0B))));
-    this._send(this._createFLAP(self._state.connections.main, FLAP_CHANNELS.SNAC,
-      this._createSNAC(SNAC_SERVICES.ICBM, 0x06, NO_FLAGS,
-        content
-      )
-    ), cb);
+    else if (info.type === 'file')
+      type = CAPABILITIES.SEND_FILE;
+    if (inout === 'out') {
+      content = cookie.concat[0x00, 0x02, who.length].concat(who).concat(this._createTLV(0x03))
+                      .concat(this._createTLV(0x05, [0x00, 0x01].concat(cookie).concat(type).concat(this._createTLV(0x0B))));
+      this._send(this._createFLAP(self._state.connections.main, FLAP_CHANNELS.SNAC,
+        this._createSNAC(SNAC_SERVICES.ICBM, 0x06, NO_FLAGS,
+          content
+        )
+      ), cb);
+    } else if (inout === 'in') {
+      if (info.type === 'file') {
+        
+      }
+    }
+    delete rndvCookies[inout][cookie];
   }
 };
 
@@ -1187,7 +1246,7 @@ OscarConnection.prototype._chatInvite = function(who, msg, roomInfo) {
   exchange = splitNum(roomInfo.exchange, 2);
   instance = splitNum(roomInfo.instance, 2);
   cookie = splitNum(Date.now(), 4).concat(splitNum(Date.now()+1, 4));
-  this._state.rndvCookies[cookie.join('')] = {
+  this._state.rndvCookies.out[cookie.join('')] = {
     cookie: cookie,
     type: 'chat',
     user: who,
@@ -1209,7 +1268,7 @@ OscarConnection.prototype._chatInvite = function(who, msg, roomInfo) {
 };
 
 OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
-  //debug('(' + conn.remoteAddress + ') SNAC response follows:\n' + sys.inspect(snac));
+  //debug('(' + conn.remoteAddress + ') SNAC response follows:\n' + util.inspect(snac));
   var serviceID, subtypeID, flags, reqID, tlvs, idx, isServerOrig, moreFollows,
       debugtext, self = this;
   serviceID = (snac[0] << 8) + snac[1];
@@ -1235,14 +1294,14 @@ OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
           tlvs = extractTLVs(snac);
           if (tlvs[TLV_TYPES.ERROR]) {
             var err = new Error(AUTH_ERRORS_TEXT[(tlvs[TLV_TYPES.ERROR][0] << 8) + tlvs[TLV_TYPES.ERROR][1]]);
-            debugtext += '(error: ' + err + ')';
+            debugtext += ' (error: ' + err + ')';
             if (typeof cb === 'function')
               cb(err);
             else
               throw err;
           } else {
             self._dispatch(reqID, undefined, tlvs[TLV_TYPES.BOS_SERVER].toString(), tlvs[TLV_TYPES.AUTH_COOKIE].toArray());
-            debugtext += '(no error)';
+            debugtext += ' (no error)';
           }
         break;
         case 0x07: // md5 salt
@@ -1454,6 +1513,14 @@ OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
     case SNAC_SERVICES.LOCATION:
       debugtext += 'LOCATION > ';
       switch (subtypeID) {
+        case 0x01: // error
+          debugtext += 'Error';
+          var code = (snac[idx++] << 8) + snac[idx++], msg = GLOBAL_ERRORS_TEXT[code] || 'Unknown error code received: ' + code,
+              err = new Error(msg);
+          err.code = code;
+          debugtext += ': ' + msg;
+          self._dispatch(reqID, err);
+        break;
         case 0x03: // limits response
           debugtext += 'Service limits';
           tlvs = extractTLVs(snac);
@@ -1597,7 +1664,7 @@ OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
           sender = sender[0];
           tlvs = extractTLVs(snac, idx);
           if (channel === 1) { // normal IMs
-            debugtext += 'IM. Sender: ' + sys.inspect(sender.name);
+            debugtext += 'IM. Sender: ' + util.inspect(sender.name);
             var msgText, charset, msgData = tlvs[0x02], flags = 0, datetime;
             for (var i=0,len=msgData.length,fragID,fragLen; i<len;) {
               fragID = msgData[i++];
@@ -1648,63 +1715,88 @@ OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
                   rndvCookie = [msgData[i++], msgData[i++], msgData[i++], msgData[i++],
                                msgData[i++], msgData[i++], msgData[i++], msgData[i++]];
               if (arraysEqual(rndvCookie, cookie)) { // cookie values _should_ match
-                var type = msgData.slice(idx, idx+16).toArray(), info = {};
-                idx += 16;
-                tlvs = extractTLVs(msgData, idx);
-                if (tlvs[0x02] && tlvs[0x02].length === 4)
-                  info.proxyIP = '' + tlvs[0x02][0] + '.' + tlvs[0x02][1] + '.' + tlvs[0x02][2] + '.' + tlvs[0x02][3];
-                if (tlvs[0x03] && tlvs[0x03].length === 4)
-                  info.clientIP = '' + tlvs[0x03][0] + '.' + tlvs[0x03][1] + '.' + tlvs[0x03][2] + '.' + tlvs[0x03][3];
-                if (tlvs[0x04] && tlvs[0x04].length === 4)
-                  info.verifiedIP = '' + tlvs[0x04][0] + '.' + tlvs[0x04][1] + '.' + tlvs[0x04][2] + '.' + tlvs[0x04][3];
-                if (tlvs[0x05])
-                  info.port = (tlvs[0x05][0] << 8) + tlvs[0x05][1];
-                if (tlvs[0x0A]) {
-                  info.reqNum = (tlvs[0x0A][0] << 8) + tlvs[0x0A][1];
-                  // reqNum === 1 -> Initial file xfer request for no/stage 1 proxy
-                  // reqNum === 2 -> reply request for stage 2 proxy (receiver wants to use a proxy)
-                  // reqNum === 3 -> third request -- only for stage 3 proxy
-                }
-                if (tlvs[0x0B])
-                  info.err = (tlvs[0x0B][0] << 8) + tlvs[0x0B][1];
-                if (tlvs[0x0C])
-                  info.msg = tlvs[0x0C].toString();
-                if (tlvs[0x0D])
-                  info.charset = tlvs[0x0D].toString();
-                if (tlvs[0x0E])
-                  info.lang = tlvs[0x0E].toString();
-                if (tlvs[0x10])
-                  info.useProxy = true;
+                if (status === ICBM_RENDEZVOUS_STATUSES.REQUEST) {
+                  var type = msgData.slice(idx, idx+16).toArray(), info = {};
+                  idx += 16;
+                  tlvs = extractTLVs(msgData, idx);
+                  if (tlvs[0x02] && tlvs[0x02].length === 4)
+                    info.proxyIP = tlvs[0x02][0] + '.' + tlvs[0x02][1] + '.' + tlvs[0x02][2] + '.' + tlvs[0x02][3];
+                  if (tlvs[0x03] && tlvs[0x03].length === 4)
+                    info.clientIP = tlvs[0x03][0] + '.' + tlvs[0x03][1] + '.' + tlvs[0x03][2] + '.' + tlvs[0x03][3];
+                  if (tlvs[0x04] && tlvs[0x04].length === 4)
+                    info.verifiedIP = tlvs[0x04][0] + '.' + tlvs[0x04][1] + '.' + tlvs[0x04][2] + '.' + tlvs[0x04][3];
+                  if (tlvs[0x05])
+                    info.port = (tlvs[0x05][0] << 8) + tlvs[0x05][1];
+                  if (tlvs[0x0A]) {
+                    info.reqNum = (tlvs[0x0A][0] << 8) + tlvs[0x0A][1];
+                    // reqNum === 1 -> Initial file xfer request for no/stage 1 proxy
+                    // reqNum === 2 -> reply request for stage 2 proxy (receiver wants to use a proxy)
+                    // reqNum === 3 -> third request -- only for stage 3 proxy
+                  }
+                  if (tlvs[0x0B])
+                    info.err = (tlvs[0x0B][0] << 8) + tlvs[0x0B][1];
+                  if (tlvs[0x0C])
+                    info.msg = tlvs[0x0C].toString();
+                  if (tlvs[0x0D])
+                    info.charset = tlvs[0x0D].toString();
+                  if (tlvs[0x0E])
+                    info.lang = tlvs[0x0E].toString();
+                  if (typeof tlvs[0x10] !== 'undefined')
+                    info.useProxy = true;
 
-                if (tlvs[0x2711]) {
-                  if (arraysEqual(type, CAPABILITIES.SEND_FILE)) {
-                    if (tlvs[0x2712])
-                      info.fnameCharset = tlvs[0x2712].toString(); // i.e. 'us-ascii'
-                    var fileInfo = self._incomingFile(info, tlvs[0x2711]);
-                    //debug('Incoming file transfer request ... Sender: ' + sys.inspect(sender) + ' File info: ' + sys.inspect(fileInfo));
-                    debugtext += ': File xfer request. Sender: ' + sys.inspect(sender.name) + ' File info: ' + sys.inspect(fileInfo);
-                    self.emit('filexfer', sender, fileInfo);
-                  } else if (arraysEqual(type, CAPABILITIES.BUDDY_ICON)) {
-                    var iconInfo = self._incomingIcon(info, tlvs[0x2711]);
-                    //debug('Incoming icon data ... Sender: ' + sys.inspect(sender) + ' Icon info: ' + sys.inspect(iconInfo));
-                    debugtext += ': Icon data. Sender: ' + sys.inspect(sender.name) + ' Icon info: ' + sys.inspect(iconInfo);
-                    self.emit('icon', sender, iconInfo.data);
-                  } else if (arraysEqual(type, CAPABILITIES.CHAT)) {
-                    var roomInfo = self._incomingChat(info, tlvs[0x2711]);
-                    //debug('Incoming chat invitation ... Sender: ' + sys.inspect(sender) + ' Chat room info: ' + sys.inspect(roomInfo));
-                    debugtext += ': Chat invitation. Sender: ' + sys.inspect(sender.name) + ' Chat room info: ' + sys.inspect(roomInfo);
-                    self.emit('chatinvite', sender, roomInfo.name, info.msg);
-                  } else if (arraysEqual(type, CAPABILITIES.SEND_CONTACT_LIST)) {
-                    var list = self._incomingList(info, tlvs[0x2711]);
-                    //debug('Incoming contact list ... Sender: ' + sys.inspect(sender) + ' List: ' + sys.inspect(list));
-                    debugtext += ': Contact list. Sender: ' + sys.inspect(sender.name) + ' List: ' + sys.inspect(list);
-                    self.emit('contactlist', sender, list);
+                  if (tlvs[0x2711]) {
+                    if (arraysEqual(type, CAPABILITIES.SEND_FILE)) {
+                      if (tlvs[0x2712])
+                        info.fnameCharset = tlvs[0x2712].toString(); // i.e. 'us-ascii'
+                      var fileInfo = self._incomingFile(tlvs[0x2711]);
+                      //debug('Incoming file transfer request ... Sender: ' + util.inspect(sender) + ' File info: ' + util.inspect(fileInfo));
+                      debugtext += ': File xfer request. Sender: ' + util.inspect(sender.name) + ' File info: ' + util.inspect(fileInfo);
+                      info.fileInfo = fileInfo;
+                      self._state.rndvCookies.in[rndvCookie] = {
+                        cookie: rndvCookie,
+                        type: 'file',
+                        user: sender.name,
+                        info: info
+                      };
+                      self.emit('filexfer', sender, rndvCookie, fileInfo);
+                    } else if (arraysEqual(type, CAPABILITIES.BUDDY_ICON)) {
+                      var iconInfo = self._incomingIcon(tlvs[0x2711]);
+                      //debug('Incoming icon data ... Sender: ' + util.inspect(sender) + ' Icon info: ' + util.inspect(iconInfo));
+                      debugtext += ': Icon data. Sender: ' + util.inspect(sender.name) + ' Icon info: ' + util.inspect(iconInfo);
+                      info.iconInfo = iconInfo;
+                      self.emit('icon', sender, iconInfo.data);
+                    } else if (arraysEqual(type, CAPABILITIES.CHAT)) {
+                      var roomInfo = self._incomingChat(tlvs[0x2711]);
+                      //debug('Incoming chat invitation ... Sender: ' + util.inspect(sender) + ' Chat room info: ' + util.inspect(roomInfo));
+                      debugtext += ': Chat invitation. Sender: ' + util.inspect(sender.name) + ' Chat room info: ' + util.inspect(roomInfo);
+                      info.roomInfo = roomInfo;
+                      self._state.rndvCookies.in[rndvCookie] = {
+                        cookie: rndvCookie,
+                        type: 'chat',
+                        user: sender.name,
+                        info: info
+                      };
+                      self.emit('chatinvite', sender, roomInfo.name, info.msg);
+                    } else if (arraysEqual(type, CAPABILITIES.SEND_CONTACT_LIST)) {
+                      var list = self._incomingList(tlvs[0x2711]);
+                      //debug('Incoming contact list ... Sender: ' + util.inspect(sender) + ' List: ' + util.inspect(list));
+                      debugtext += ': Contact list. Sender: ' + util.inspect(sender.name) + ' List: ' + util.inspect(list);
+                      info.listInfo = list;
+                      self.emit('contactlist', sender, list);
+                    }
+                  }
+                } else if (status === ICBM_RENDEZVOUS_STATUSES.ACCEPT) {
+                } else if (status === ICBM_RENDEZVOUS_STATUSES.CANCEL) {
+                  if (self._state.p2p[rndvCookie]) {
+                    self._state.p2p[rndvCookie].conn.end();
+                    delete self._state.p2p[rndvCookie];
+                    // TODO: emit event or let the module user that the other side canceled?
                   }
                 }
               }
             }
           } else if (channel === 4)
-            debugtext += 'Unknown (channel 4). Sender: ' + sys.inspect(sender.name);
+            debugtext += 'Unknown (channel 4). Sender: ' + util.inspect(sender.name);
         break;
         case 0x08: // warn request ACK
           debugtext += 'Warn request ACK';
@@ -1852,7 +1944,7 @@ OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
               if (exgTLVs[0xD9])
                 self._state.svcInfo[SNAC_SERVICES.CHAT_NAV].exchanges[id].lang2 = exgTLVs[0xD9].toString();
             }
-            //debug('exchange info: ' + sys.inspect(self._state.svcInfo[SNAC_SERVICES.CHAT_NAV].exchanges, false, 4));
+            //debug('exchange info: ' + util.inspect(self._state.svcInfo[SNAC_SERVICES.CHAT_NAV].exchanges, false, 4));
             debugtext += ';';
           }
           if (tlvs[0x04]) { // room info
@@ -2822,7 +2914,7 @@ OscarConnection.prototype._createFLAP = function(conn, channel, value) {
           if (!isNaN(parseInt(''+value[i])))
             value[i] = parseInt(''+value[i]);
           else
-            throw new Error('_createFLAP :: Only numbers can be in an Array value. Found a(n) ' + typeof value[i] + ' at index ' + i + ': ' + sys.inspect(value[i]));
+            throw new Error('_createFLAP :: Only numbers can be in an Array value. Found a(n) ' + typeof value[i] + ' at index ' + i + ': ' + util.inspect(value[i]));
         }
         if (value[i] > 0xFF)
           Array.prototype.splice.apply(value, [i, 1].concat(splitNum(value[i])));
@@ -2856,7 +2948,7 @@ OscarConnection.prototype._createSNAC = function(serviceID, subtypeID, flags, va
           if (!isNaN(parseInt(''+value[i])))
             value[i] = parseInt(''+value[i]);
           else
-            throw new Error('_createSNAC :: Only numbers can be in an Array value. Found a(n) ' + typeof value[i] + ' at index ' + i + ': ' + sys.inspect(value[i]));
+            throw new Error('_createSNAC :: Only numbers can be in an Array value. Found a(n) ' + typeof value[i] + ' at index ' + i + ': ' + util.inspect(value[i]));
         }
         if (value[i] > 0xFF)
           Array.prototype.splice.apply(value, [i, 1].concat(splitNum(value[i])));
@@ -2891,7 +2983,7 @@ OscarConnection.prototype._createTLV = function(type, value) {
           if (!isNaN(parseInt(''+value[i])))
             value[i] = parseInt(''+value[i]);
           else
-            throw new Error('_createTLV :: Only numbers can be in an Array value. Found a(n) ' + typeof value[i] + ' at index ' + i + ': ' + sys.inspect(value[i]));
+            throw new Error('_createTLV :: Only numbers can be in an Array value. Found a(n) ' + typeof value[i] + ' at index ' + i + ': ' + util.inspect(value[i]));
         }
         if (value[i] > 0xFF)
           Array.prototype.splice.apply(value, [i, 1].concat(splitNum(value[i])));
@@ -3046,12 +3138,6 @@ Buffer.prototype.append = function(buf) {
 
   return newBuf;
 };
-
-if (typeof hexy !== 'undefined') {
-  Buffer.prototype.inspect = function () {
-    return hexy(this, hexyFormat);
-  }
-}
 
 Buffer.prototype.toArray = function() {
   return Array.prototype.slice.call(this);

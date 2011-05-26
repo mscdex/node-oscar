@@ -128,6 +128,8 @@ OscarConnection Functions
 
 * **connect**(Function) - _(void)_ - Connects to the OSCAR server. The Function parameter is the callback with one argument: the error (undefined if none).
 
+* **end**() - _(void)_ - Disconnects from the OSCAR server.
+
 * **setIdle**(Integer/Boolean) - _(void)_ - If an Integer is supplied, your idle time is set to that many seconds. If Boolean false is given, then you are no longer set as idle. Note: setIdle only needs to be called once when you are idle and again when you are no longer idle. The server will automatically increment the idle time for you, so don't call setIdle every second.
 
 * **sendIM**(String, String[, Integer[, Function]]) - _(void)_ - Sends an instant message. The first parameter is the recipient's user name, the second is the message text. The third parameter is an optional bit field containing message flags to use (see the IM\_FLAGS constants). The Function parameter is an optional callback (with one argument: the error (undefined if none) containing relevant code and subcode properties (see the MSG_ERRORS AND MSG_SUBERRORS constants)) that if supplied, will request an acknowledgement from the server that the message was sent ok.
