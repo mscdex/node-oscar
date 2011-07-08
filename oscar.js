@@ -74,7 +74,7 @@ OscarConnection.prototype.setIdle = function(amount) { // amount is in seconds i
   else if (typeof amount !== 'number' || amount <= 0 || amount === true)
     throw new Error('Amount must be boolean false or a positive number > 0');
 
-  this._send(this._createFLAP(self._state.connections.main, FLAP_CHANNELS.SNAC,
+  this._send(this._createFLAP(this._state.connections.main, FLAP_CHANNELS.SNAC,
     this._createSNAC(SNAC_SERVICES.GENERIC, 0x11, NO_FLAGS,
       [(amount >> 24 & 0xFF), (amount >> 16 & 0xFF), (amount >> 8 & 0xFF), (amount & 0xFF)]
     )
@@ -704,6 +704,7 @@ function connect_handler(oscar) {
       self._state.connections.main = self._state.connections.login;
       delete self._state.connections.login;
       conn.id = 'main';
+      self._restartKeepalive();
     }
     conn.serverType = 'BOS';
     conn.isTransferring = false;
@@ -1113,6 +1114,9 @@ OscarConnection.prototype._send = function(conn, payload, cb) {
   payload = new Buffer(payload);
   debug('(' + conn.remoteAddress + ') SENDING: \n' + util.inspect(payload) + '\n');
   conn.write(payload);
+  
+  if (conn == self._state.connections.main)
+    self._restartKeepalive();
 };
 
 OscarConnection.prototype._dispatch = function(reqID) {
@@ -1197,7 +1201,7 @@ OscarConnection.prototype._sendIcon = function(who) {
         content.push(this.icon.data[i]);
       content = content.concat(str2bytes('AVT1picture.id'));
 
-      this._send(this._createFLAP(self._state.connections.main, FLAP_CHANNELS.SNAC,
+      this._send(this._createFLAP(this._state.connections.main, FLAP_CHANNELS.SNAC,
         this._createSNAC(SNAC_SERVICES.ICBM, 0x06, NO_FLAGS,
           content
         )
@@ -1224,7 +1228,7 @@ OscarConnection.prototype._cancelRendezvous = function(inout, cookie, cb) {
     if (inout === 'out') {
       content = cookie.concat[0x00, 0x02, who.length].concat(who).concat(this._createTLV(0x03))
                       .concat(this._createTLV(0x05, [0x00, 0x01].concat(cookie).concat(type).concat(this._createTLV(0x0B))));
-      this._send(this._createFLAP(self._state.connections.main, FLAP_CHANNELS.SNAC,
+      this._send(this._createFLAP(this._state.connections.main, FLAP_CHANNELS.SNAC,
         this._createSNAC(SNAC_SERVICES.ICBM, 0x06, NO_FLAGS,
           content
         )
@@ -2994,6 +2998,22 @@ OscarConnection.prototype._createTLV = function(type, value) {
   return [(type >> 8 & 0xFF), (type & 0xFF),  (value.length >> 8 & 0xFF), (value.length & 0xFF)].concat(value);
 };
 
+OscarConnection.prototype._sendKeepalive = function() {
+  var conn = this._state.connections.main;
+  if (conn && conn.isConnected) {
+    this._send(conn, this._createFLAP(conn, FLAP_CHANNELS.KEEPALIVE));
+  } else {
+    clearTimeout(this._keepaliveTimer);
+  }
+};
+
+OscarConnection.prototype._restartKeepalive = function() {
+  var self = this;
+  if (this._keepaliveTimer)
+    clearTimeout(this._keepaliveTimer);
+  this._keepaliveTimer = setInterval(function() { self._sendKeepalive(); }, KEEPALIVE_INTERVAL);
+};
+
 /**
  * Adopted from jquery's extend method. Under the terms of MIT License.
  *
@@ -3657,6 +3677,7 @@ var NO_FLAGS = 0x0000;
 var MAX_SN_LEN = 97;
 var MAX_MSG_LEN = 2544;
 var MAX_ICON_LEN = 7168;
+var KEEPALIVE_INTERVAL = 60*1000;
 var SERVER_AOL = 'login.oscar.aol.com';
 var SERVER_ICQ = 'login.icq.com';
 // End Constants -----------------------------------------------------------------------------
