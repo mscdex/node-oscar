@@ -699,12 +699,12 @@ function connect_handler(oscar) {
   conn.availServices = {};
   conn.isConnected = true;
   clearTimeout(conn.tmrConn);
+  conn.restartKeepAlive();
   if (conn.isTransferring) {
     if (conn.id === 'login') {
       self._state.connections.main = self._state.connections.login;
       delete self._state.connections.login;
       conn.id = 'main';
-      self._restartKeepalive();
     }
     conn.serverType = 'BOS';
     conn.isTransferring = false;
@@ -855,6 +855,12 @@ OscarConnection.prototype._addConnection = function(id, services, host, port, cb
   self._state.connections[id].tmrConn = setTimeout(self._state.connections[id].fnTmrConn, self._options.connection.connTimeout, cb);
   self._state.connections[id].setTimeout(0);
   self._state.connections[id].setKeepAlive(true);
+  self._state.connections[id].restartKeepAlive = function() {
+    var conn = this;
+    if (conn.keepAliveTimer)
+      clearTimeout(conn.keepAliveTimer);
+    conn.keepAliveTimer = setInterval(function() { self._sendKeepAlive(conn); }, KEEPALIVE_INTERVAL);
+  };
   self._state.connections[id].on('connect', function() { connect_handler.call(this, self); });
   self._state.connections[id].on('data', function(data) { data_handler.call(this, self, data, cb); });
   self._state.connections[id].on('end', function() { end_handler.call(this, self); });
@@ -1115,8 +1121,7 @@ OscarConnection.prototype._send = function(conn, payload, cb) {
   debug('(' + conn.remoteAddress + ') SENDING: \n' + util.inspect(payload) + '\n');
   conn.write(payload);
   
-  if (conn == self._state.connections.main)
-    self._restartKeepalive();
+  conn.restartKeepAlive();
 };
 
 OscarConnection.prototype._dispatch = function(reqID) {
@@ -2998,20 +3003,14 @@ OscarConnection.prototype._createTLV = function(type, value) {
   return [(type >> 8 & 0xFF), (type & 0xFF),  (value.length >> 8 & 0xFF), (value.length & 0xFF)].concat(value);
 };
 
-OscarConnection.prototype._sendKeepalive = function() {
-  var conn = this._state.connections.main;
+OscarConnection.prototype._sendKeepAlive = function(conn) {
+  if (!conn)
+    conn = this._state.connections.main;
   if (conn && conn.isConnected) {
     this._send(conn, this._createFLAP(conn, FLAP_CHANNELS.KEEPALIVE));
   } else {
-    clearTimeout(this._keepaliveTimer);
+    clearTimeout(conn.keepAliveTimer);
   }
-};
-
-OscarConnection.prototype._restartKeepalive = function() {
-  var self = this;
-  if (this._keepaliveTimer)
-    clearTimeout(this._keepaliveTimer);
-  this._keepaliveTimer = setInterval(function() { self._sendKeepalive(); }, KEEPALIVE_INTERVAL);
 };
 
 /**

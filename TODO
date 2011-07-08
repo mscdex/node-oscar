@@ -1,9 +1,5 @@
 - More ICQ testing and incorporation of ICQ-specific features
 
-- Use setTimeout to send a keepalive packet on FLAP channel 0x05 -- time == 1 min? Digsby & Pidgin use a 30 sec timeout)
-  Note: Pidgin only seems to send keepalive on the main connection, unlike Digsby which sends keepalive on every connection
-  Also: the timer should be (re)started after each write to the socket and thus should not be sent if the connection isn't idle
-
 - Pay attention to rate warnings and limits -- automatically do this at the _send() level and queue up commands before we hit
   the limit and SNACs start dropping, or let the user handle throttling by emitting rate-related events?
 
