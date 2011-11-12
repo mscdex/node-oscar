@@ -717,7 +717,7 @@ function data_handler(oscar, data, cb) {
   var self = oscar, conn = this;
   //debug('(' + conn.remoteAddress + ') RECEIVED: \n' + util.inspect(data)) + '\n';
   if (conn.curData)
-    conn.curData = conn.curData.append(data);
+    conn.curData = bufferAppend(conn.curData, data);
   else
     conn.curData = data;
   data = conn.curData;
@@ -2547,7 +2547,7 @@ OscarConnection.prototype._downloadIcons = function(who, hashes, skipCheck, cb) 
       debug('Attempting to download an icon for ' + who + ' ...');
       if (res.statusCode === 200) {
         res.on('data', function(data) {
-          iconData = (!iconData ? data : iconData.append(data));
+          iconData = (!iconData ? data : bufferAppend(iconData, data);
         });
         res.on('end', function() {
           debug('Icon download successful for ' + who);
@@ -3145,14 +3145,14 @@ function arraysEqual(a, b) {
   return equal;
 }
 
-Buffer.prototype.append = function(buf) {
-  var newBuf = new Buffer(this.length + buf.length);
-  this.copy(newBuf, 0, 0);
-  if (Buffer.isBuffer(buf))
-    buf.copy(newBuf, this.length, 0);
-  else if (Array.isArray(buf)) {
-    for (var i=this.length, len=buf.length; i<len; i++)
-      newBuf[i] = buf[i];
+function bufferAppend = function(buf1, buf2) {
+  var newBuf = new Buffer(buf1.length + buf2.length);
+  buf1.copy(newBuf, 0, 0);
+  if (Buffer.isBuffer(buf2))
+    buf2.copy(newBuf, buf1.length, 0);
+  else if (Array.isArray(buf2)) {
+    for (var i=buf1.length, len=buf2.length; i<len; i++)
+      newBuf[i] = buf2[i];
   }
 
   return newBuf;
