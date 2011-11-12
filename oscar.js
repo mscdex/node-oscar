@@ -3006,11 +3006,10 @@ OscarConnection.prototype._createTLV = function(type, value) {
 OscarConnection.prototype._sendKeepAlive = function(conn) {
   if (!conn)
     conn = this._state.connections.main;
-  if (conn && conn.isConnected) {
+  if (conn && conn.isConnected)
     this._send(conn, this._createFLAP(conn, FLAP_CHANNELS.KEEPALIVE));
-  } else {
+  else
     clearTimeout(conn.keepAliveTimer);
-  }
 };
 
 /**
@@ -3475,19 +3474,19 @@ var USER_CLASSES = {
   UNKNOWN800: 0x0800     // Unknown bit
 };
 var USER_STATUSES = { // 1st two bytes of user status field
-	ONLINE: 0x0000,
-	AWAY: 0x0001,
-	DND: 0x0002,
-	NA: 0x0004,
-	OCCUPIED: 0x0010,
-	FREE4CHAT: 0x0020,
-	INVISIBLE: 0x0100,
- 	EVIL: 0x3000,
- 	DEPRESSION: 0x4000,
- 	ATHOME: 0x5000,
- 	ATWORK: 0x6000,
- 	LUNCH: 0x2001,
- 	OFFLINE: 0xFFFF
+  ONLINE: 0x0000,
+  AWAY: 0x0001,
+  DND: 0x0002,
+  NA: 0x0004,
+  OCCUPIED: 0x0010,
+  FREE4CHAT: 0x0020,
+  INVISIBLE: 0x0100,
+  EVIL: 0x3000,
+  DEPRESSION: 0x4000,
+  ATHOME: 0x5000,
+  ATWORK: 0x6000,
+  LUNCH: 0x2001,
+  OFFLINE: 0xFFFF
 };
 var USER_FLAGS = { // 2nd two bytes of user status field
   WEBAWARE: 0x0001,   // Status webaware flag
