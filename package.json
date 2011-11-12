@@ -1,5 +1,5 @@
 { "name": "oscar",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "Brian White <mscdex@mscdex.net>",
   "description": "An OSCAR protocol module for node.js",
   "main": "./oscar",
