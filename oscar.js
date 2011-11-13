@@ -3144,7 +3144,7 @@ function arraysEqual(a, b) {
   return equal;
 }
 
-function bufferAppend = function(buf1, buf2) {
+function bufferAppend(buf1, buf2) {
   var newBuf = new Buffer(buf1.length + buf2.length);
   buf1.copy(newBuf, 0, 0);
   if (Buffer.isBuffer(buf2))
