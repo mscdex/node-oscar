@@ -788,8 +788,9 @@ function end_handler(oscar) {
   var self = oscar, conn = this;
   conn.isConnected = false;
   if (!conn.isTransferring) {
-    self._resetState();
-    debug('(' + conn.remoteAddress + ') FIN packet received. Disconnecting...');
+    if (conn === self._state.connections.main)
+      self._resetState();
+    debug('(' + conn.remoteAddress + ') [' + getConnSvcNames(conn) + '] FIN packet received. Disconnecting...');
     self.emit('end');
   }
 }
@@ -809,8 +810,9 @@ function close_handler(oscar, had_error) {
   var self = oscar, conn = this;
   conn.isConnected = false;
   if (!conn.isTransferring || had_error) {
-    self._resetState();
-    debug('(' + conn.remoteAddress + ') Connection forcefully closed.');
+    if (conn === self._state.connections.main)
+      self._resetState();
+    debug('(' + conn.remoteAddress + ') [' + getConnSvcNames(conn) + '] Connection forcefully closed.');
     self.emit('close', had_error);
   }
 }
@@ -3175,6 +3177,28 @@ net.Stream.prototype.connect = function(port, host) {
   this.remotePort = port;
   _oldStreamConnect.apply(this, Array.prototype.slice.call(arguments));
 };
+
+function getConnSvcNames(conn) {
+  if (conn.id === 'login')
+    return 'login';
+
+  var svcTypes = Object.keys(SNAC_SERVICES),
+      availServices = Object.keys(conn.availServices).map(function(x) {
+        return parseInt(x);
+      }),
+      services = [];
+
+  for (var i=0,len=availServices.length; i<len; ++i) {
+    for (var j=0,len2=svcTypes.length; j<len2; ++j) {
+      if (availServices[i] === SNAC_SERVICES[svcTypes[j]]) {
+        services.push(svcTypes[j]);
+        break;
+      }
+    }
+  }
+
+  return services.join(', ');
+}
 
 // Constants ---------------------------------------------------------------------------------
 var FLAP_CHANNELS = {
