@@ -788,10 +788,11 @@ function end_handler(oscar) {
   var self = oscar, conn = this;
   conn.isConnected = false;
   if (!conn.isTransferring) {
-    if (conn === self._state.connections.main)
+    if (conn === self._state.connections.main) {
       self._resetState();
+      self.emit('end');
+    }
     debug('(' + conn.remoteAddress + ') [' + getConnSvcNames(conn) + '] FIN packet received. Disconnecting...');
-    self.emit('end');
   }
 }
 
@@ -810,10 +811,11 @@ function close_handler(oscar, had_error) {
   var self = oscar, conn = this;
   conn.isConnected = false;
   if (!conn.isTransferring || had_error) {
-    if (conn === self._state.connections.main)
+    if (conn === self._state.connections.main) {
       self._resetState();
+      self.emit('close', had_error);
+    }
     debug('(' + conn.remoteAddress + ') [' + getConnSvcNames(conn) + '] Connection forcefully closed.');
-    self.emit('close', had_error);
   }
 }
 
