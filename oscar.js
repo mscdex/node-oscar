@@ -844,7 +844,10 @@ OscarConnection.prototype._resetState = function() {
 
 OscarConnection.prototype._addConnection = function(id, services, host, port, cb) {
   var self = this;
-  self._state.connections[id] = net.createConnection(port, host);
+  
+  self._state.connections[id] = new net.Socket();
+  self._state.connections[id].connect(port, host);
+  
   self._state.connections[id].id = id;
   self._state.connections[id].neededServices = services;
   self._state.connections[id].serverType = (id === 'login' ? 'login' : 'BOS');
