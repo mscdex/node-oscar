@@ -1,5 +1,7 @@
-var net = require('net'), util = require('util'),
-    EventEmitter = require('events').EventEmitter, crypto = require('crypto');
+var net = require('net'),
+    util = require('util'),
+    EventEmitter = require('events').EventEmitter,
+    crypto = require('crypto');
 var fnEmpty = function() {};
 var debug = fnEmpty, hexy, inspectMutated = false,
     hexyFormat = {
@@ -3163,21 +3165,6 @@ function bufferAppend(buf1, buf2) {
 
 Buffer.prototype.toArray = function() {
   return Array.prototype.slice.call(this);
-};
-
-var _oldBufferToString = Buffer.prototype.toString;
-Buffer.prototype.toString = function() {
-  if (arguments.length > 0 && arguments[0] === 'hex')
-    return toHexStr(this);
-  else
-    return _oldBufferToString.apply(this, Array.prototype.slice.call(arguments));
-};
-
-var _oldStreamConnect = net.Stream.prototype.connect;
-net.Stream.prototype.connect = function(port, host) {
-  this.remoteAddress = host;
-  this.remotePort = port;
-  _oldStreamConnect.apply(this, Array.prototype.slice.call(arguments));
 };
 
 function getConnSvcNames(conn) {

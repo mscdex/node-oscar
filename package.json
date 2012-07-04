@@ -3,7 +3,7 @@
   "author": "Brian White <mscdex@mscdex.net>",
   "description": "An OSCAR protocol module for node.js",
   "main": "./oscar",
-  "engines": { "node": ">=0.2.0" },
+  "engines": { "node": ">=0.6.0" },
   "keywords": [ "aim", "icq", "oscar", "aol", "im", "chat", "client" ],
   "licenses": [ { "type": "MIT", "url": "http://github.com/mscdex/node-oscar/raw/master/LICENSE" } ],
   "repository": { "type": "git", "url": "http://github.com/mscdex/node-oscar.git" }
