@@ -846,7 +846,7 @@ OscarConnection.prototype._resetState = function() {
 
 OscarConnection.prototype._addConnection = function(id, services, host, port, cb) {
   var self = this;
-  self._state.connections[id] = net.createConnection(port, host);
+  self._state.connections[id] = new net.Socket();
   self._state.connections[id].id = id;
   self._state.connections[id].neededServices = services;
   self._state.connections[id].serverType = (id === 'login' ? 'login' : 'BOS');
@@ -872,6 +872,7 @@ OscarConnection.prototype._addConnection = function(id, services, host, port, cb
   self._state.connections[id].on('end', function() { end_handler.call(this, self); });
   self._state.connections[id].on('error', function(err) { error_handler.call(this, self, err, cb); });
   self._state.connections[id].on('close', function(had_error) { close_handler.call(this, self, had_error); });
+  self._state.connections[id].connect(port, host);
 }
 
 OscarConnection.prototype._addService = function(svc, roomInfo, cb) {
