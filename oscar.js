@@ -213,6 +213,7 @@ OscarConnection.prototype.warn = function(who, isAnonymous, cb) {
 };
 
 OscarConnection.prototype.notifyTyping = function(who, which) {
+  var self = this;
   who = str2bytes(''+who);
   if (who.length > MAX_SN_LEN)
     throw new Error('Screen names cannot be longer than ' + MAX_SN_LEN + ' characters');
