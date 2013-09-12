@@ -2672,7 +2672,7 @@ OscarConnection.prototype._login = function(error, conn, loginCb, reentry) {
           clientInfo.vLesser = [0x00, 0x00];
           clientInfo.vBuild = [0x0C, 0x18];
         }
-        oldhash = crypto.createHash('md5').update(salt).update(self._options.connection.password).update('AOL Instant Messenger (SM)').digest();
+        oldhash = crypto.createHash('md5').update(salt).update(self._options.connection.password).update('AOL Instant Messenger (SM)').digest('binary');
         for (var i=0,len=oldhash.length; i<len; i++)
           hash[i] = oldhash.charCodeAt(i);
         self._send(conn, self._createFLAP(conn, FLAP_CHANNELS.SNAC,
