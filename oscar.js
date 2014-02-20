@@ -1230,7 +1230,7 @@ OscarConnection.prototype.sendFile = function(who, file, ip, port, cb) {
 
 OscarConnection.prototype._cancelRendezvous = function(inout, cookie, cb) {
   cookie = ''+cookie;
-  var info = rndvCookies[inout][cookie];
+  var info = this._state.rndvCookies[inout][cookie];
   if (typeof info !== 'undefined') {
     var content, type;
     cookie = info.cookie;
@@ -1251,7 +1251,7 @@ OscarConnection.prototype._cancelRendezvous = function(inout, cookie, cb) {
         
       }
     }
-    delete rndvCookies[inout][cookie];
+    delete this._state.rndvCookies[inout][cookie];
   }
 };
 
