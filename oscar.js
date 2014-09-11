@@ -683,7 +683,13 @@ OscarConnection.prototype.connect = function(cb) {
           cb(e);
         return;
       }
-      self._addService(SNAC_SERVICES.CHAT_NAV, cb);
+
+      self._addService(SNAC_SERVICES.CHAT_NAV, function(e){
+          if(typeof cb == 'function'){
+              cb(e);
+              return;
+          }
+      });
     });
   });
 };
