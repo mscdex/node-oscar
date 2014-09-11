@@ -593,6 +593,8 @@ OscarConnection.prototype.getOfflineMsgs = function() {
 };
 
 OscarConnection.prototype.joinChat = function(name, cb) {
+  cb = cb || function(err){console.log(err)}
+  
   var self = this;
   if (!self._state.chatrooms[name]) {
     var exchange = 4;
