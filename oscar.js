@@ -2216,55 +2216,56 @@ OscarConnection.prototype._parseSNAC = function(conn, snac, cb) {
                   items[item.type][item.groupID][item.itemID] = item;
                 }
               }
-            }
-            for (var i=0,groups=Object.keys(items[0x01]),len=groups.length,group; i<len; i++) {
-              group = groups[i];
-              self.contacts.list[group] = {
-                name: items[0x01][group].name,
-                contacts: {},
-                group: group,
-                item: items[0x01][group].itemID,
-                type: 0x01
-              };
-              if (items[0x01][group].tlvs && items[0x01][group].tlvs[0x00C8]) {
-                // add contacts
-                for (var j=0,len2=items[0x01][group].tlvs[0x00C8].length,contact; j<len2; j+=2) {
-                  contact = (items[0x01][group].tlvs[0x00C8][j] << 8) + items[0x01][group].tlvs[0x00C8][j+1];
-                  self.contacts.list[group].contacts[contact] = {
-                    name: items[0x00][group][contact].name,
-                    status: USER_STATUSES.OFFLINE,
-                    localInfo: {
-                      alias: (items[0x00][group][contact].tlvs && items[0x00][group][contact].tlvs[0x0131]
-                              ? items[0x00][group][contact].tlvs[0x0131].toString() : undefined),
-                      emailAddress: (items[0x00][group][contact].tlvs && items[0x00][group][contact].tlvs[0x0137]
-                                     ? items[0x00][group][contact].tlvs[0x0137].toString() : undefined),
-                      homePhoneNum: (items[0x00][group][contact].tlvs && items[0x00][group][contact].tlvs[0x0138]
-                                     ? items[0x00][group][contact].tlvs[0x0138].toString() : undefined),
-                      cellPhoneNum: (items[0x00][group][contact].tlvs && items[0x00][group][contact].tlvs[0x0139]
-                                     ? items[0x00][group][contact].tlvs[0x0139].toString() : undefined),
-                      smsPhoneNum: (items[0x00][group][contact].tlvs && items[0x00][group][contact].tlvs[0x013A]
-                                    ? items[0x00][group][contact].tlvs[0x013A].toString() : undefined),
-                      workPhoneNum: (items[0x00][group][contact].tlvs && items[0x00][group][contact].tlvs[0x0158]
-                                     ? items[0x00][group][contact].tlvs[0x0158].toString() : undefined),
-                      otherPhoneNum: (items[0x00][group][contact].tlvs && items[0x00][group][contact].tlvs[0x0159]
-                                      ? items[0x00][group][contact].tlvs[0x0159].toString() : undefined),
-                      notes: (items[0x00][group][contact].tlvs && items[0x00][group][contact].tlvs[0x013C]
-                              ? items[0x00][group][contact].tlvs[0x013C].toString() : undefined)
-                    },
-                    awaitingAuth: (items[0x00][group][contact].tlvs && items[0x00][group][contact].tlvs[0x0066] ? true : false),
-                    alert: (items[0x00][group][contact].tlvs && items[0x00][group][contact].tlvs[0x013D]
-                            ? { when: items[0x00][group][contact].tlvs[0x013D][0],
-                                how: items[0x00][group][contact].tlvs[0x013D][1],
-                                sound: (items[0x00][group][contact].tlvs[0x013D][0] === 0x02
-                                        ? items[0x00][group][contact].tlvs[0x013E] : undefined)
-                              } : undefined),
-                    group: group,
-                    item: contact,
-                    type: 0x00
-                  };
-                }
-              }
-            }
+            };
+            if (typeof items[0x01]!=='undefined') //if it not new user and he has groups
+	            for (var i=0,groups=Object.keys(items[0x01]),len=groups.length,group; i<len; i++) {
+	              group = groups[i];
+	              self.contacts.list[group] = {
+	                name: items[0x01][group].name,
+	                contacts: {},
+	                group: group,
+	                item: items[0x01][group].itemID,
+	                type: 0x01
+	              };
+	              if (items[0x01][group].tlvs && items[0x01][group].tlvs[0x00C8]) {
+	                // add contacts
+	                for (var j=0,len2=items[0x01][group].tlvs[0x00C8].length,contact; j<len2; j+=2) {
+	                  contact = (items[0x01][group].tlvs[0x00C8][j] << 8) + items[0x01][group].tlvs[0x00C8][j+1];
+	                  self.contacts.list[group].contacts[contact] = {
+	                    name: items[0x00][group][contact].name,
+	                    status: USER_STATUSES.OFFLINE,
+	                    localInfo: {
+	                      alias: (items[0x00][group][contact].tlvs && items[0x00][group][contact].tlvs[0x0131]
+	                              ? items[0x00][group][contact].tlvs[0x0131].toString() : undefined),
+	                      emailAddress: (items[0x00][group][contact].tlvs && items[0x00][group][contact].tlvs[0x0137]
+	                                     ? items[0x00][group][contact].tlvs[0x0137].toString() : undefined),
+	                      homePhoneNum: (items[0x00][group][contact].tlvs && items[0x00][group][contact].tlvs[0x0138]
+	                                     ? items[0x00][group][contact].tlvs[0x0138].toString() : undefined),
+	                      cellPhoneNum: (items[0x00][group][contact].tlvs && items[0x00][group][contact].tlvs[0x0139]
+	                                     ? items[0x00][group][contact].tlvs[0x0139].toString() : undefined),
+	                      smsPhoneNum: (items[0x00][group][contact].tlvs && items[0x00][group][contact].tlvs[0x013A]
+	                                    ? items[0x00][group][contact].tlvs[0x013A].toString() : undefined),
+	                      workPhoneNum: (items[0x00][group][contact].tlvs && items[0x00][group][contact].tlvs[0x0158]
+	                                     ? items[0x00][group][contact].tlvs[0x0158].toString() : undefined),
+	                      otherPhoneNum: (items[0x00][group][contact].tlvs && items[0x00][group][contact].tlvs[0x0159]
+	                                      ? items[0x00][group][contact].tlvs[0x0159].toString() : undefined),
+	                      notes: (items[0x00][group][contact].tlvs && items[0x00][group][contact].tlvs[0x013C]
+	                              ? items[0x00][group][contact].tlvs[0x013C].toString() : undefined)
+	                    },
+	                    awaitingAuth: (items[0x00][group][contact].tlvs && items[0x00][group][contact].tlvs[0x0066] ? true : false),
+	                    alert: (items[0x00][group][contact].tlvs && items[0x00][group][contact].tlvs[0x013D]
+	                            ? { when: items[0x00][group][contact].tlvs[0x013D][0],
+	                                how: items[0x00][group][contact].tlvs[0x013D][1],
+	                                sound: (items[0x00][group][contact].tlvs[0x013D][0] === 0x02
+	                                        ? items[0x00][group][contact].tlvs[0x013E] : undefined)
+	                              } : undefined),
+	                    group: group,
+	                    item: contact,
+	                    type: 0x00
+	                  };
+	                }
+	              }
+	            }
             self.contacts.lastModified = new Date(((snac[idx++] << 24) + (snac[idx++] << 16) + (snac[idx++] << 8) + snac[idx++]) * 1000);
             self._dispatch(reqID);
           }
